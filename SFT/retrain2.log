@@ -1,0 +1,10 @@
+Thu Nov 19 01:22:48 PM CST 2026 retrain sudoku+countdown drafter started
+Thu Nov 19 02:48:24 PM CST 2026 sudoku gen done
+Thu Nov 19 02:48:24 PM CST 2026 countdown gen done
+Thu Nov 19 04:05:26 PM CST 2026 sudoku drafter done
+Thu Nov 19 04:05:26 PM CST 2026 countdown drafter done
+  dspark_sudoku_sft  tau=4.631
+  dspark_countdown_sft  tau=3.387
+Thu Nov 19 04:05:29 PM CST 2026 ALL DONE
+dspark_countdown_sft  tau=3.387
+Thu Nov 19 04:05:29 PM CST 2026 ALL DONE

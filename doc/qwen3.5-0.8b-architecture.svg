@@ -1,0 +1,203 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 1340" width="1440" height="1340" font-family="'Noto Sans CJK SC','Source Han Sans SC','PingFang SC','Microsoft YaHei','Hiragino Sans GB',sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#cbd5e1"/>
+    </marker>
+  </defs>
+
+  <rect width="1440" height="1340" fill="#ffffff"/>
+
+  <!-- header -->
+  <text x="60" y="46" font-size="25" font-weight="700" fill="#0f172a">Qwen3.5-0.8B-Base 模型结构</text>
+  <text x="60" y="72" font-size="13" fill="#64748b">0.873B 参数 · 24 层混合注意力解码器 + 12 层视觉编码器 · 原生 262,144 token 上下文 · bf16</text>
+  <line x1="60" y1="86" x2="1380" y2="86" stroke="#e2e8f0" stroke-width="1"/>
+
+  <!-- ================= inputs ================= -->
+  <rect x="60" y="110" width="370" height="58" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="80" y="134" font-size="13" font-weight="600" fill="#0f172a">文本 token ids</text>
+  <text x="80" y="154" font-size="11.5" fill="#64748b">词表 248,320（填充后）· 序列 ≤ 262,144</text>
+
+  <rect x="470" y="110" width="370" height="58" rx="8" fill="#fffbeb" stroke="#fcd34d"/>
+  <text x="490" y="134" font-size="13" font-weight="600" fill="#92400e">图像 / 视频像素</text>
+  <text x="490" y="154" font-size="11.5" fill="#a16207">patch 16 · temporal 2 · spatial merge 2×2</text>
+
+  <line x1="245" y1="168" x2="245" y2="194" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="655" y1="168" x2="655" y2="194" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+
+  <!-- ================= embeddings ================= -->
+  <rect x="60" y="196" width="370" height="66" rx="8" fill="#eef2ff" stroke="#818cf8"/>
+  <text x="80" y="220" font-size="13" font-weight="600" fill="#3730a3">Token Embedding 248,320 × 1,024</text>
+  <text x="80" y="240" font-size="11.5" fill="#4338ca">与 LM Head 共享权重（tie_word_embeddings）</text>
+
+  <rect x="470" y="196" width="370" height="66" rx="8" fill="#fffbeb" stroke="#fcd34d"/>
+  <text x="490" y="220" font-size="13" font-weight="600" fill="#92400e">PatchEmbed</text>
+  <text x="490" y="240" font-size="11.5" fill="#a16207">Conv3d 3→768, k=(2,16,16) + pos_embed 2,304×768</text>
+
+  <line x1="655" y1="262" x2="655" y2="288" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+
+  <!-- ================= vision tower ================= -->
+  <rect x="470" y="290" width="370" height="104" rx="8" fill="#fffbeb" stroke="#f59e0b"/>
+  <text x="490" y="314" font-size="13" font-weight="600" fill="#92400e">视觉编码器 Block × 12</text>
+  <text x="490" y="334" font-size="11.5" fill="#a16207">LayerNorm → 自注意力（12 头 × 64 维，2D RoPE）</text>
+  <text x="490" y="352" font-size="11.5" fill="#a16207">变长打包（cu_seqlens）· 无 padding 冗余</text>
+  <text x="490" y="370" font-size="11.5" fill="#a16207">LayerNorm → MLP 768 → 3,072 → 768</text>
+  <text x="820" y="314" font-size="11" font-weight="600" fill="#b45309" text-anchor="end">100.6M</text>
+
+  <line x1="655" y1="394" x2="655" y2="420" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+
+  <rect x="470" y="422" width="370" height="96" rx="8" fill="#fffbeb" stroke="#fcd34d"/>
+  <text x="490" y="446" font-size="13" font-weight="600" fill="#92400e">Patch Merger</text>
+  <text x="490" y="466" font-size="11.5" fill="#a16207">2×2 空间合并 → 3,072 维</text>
+  <text x="490" y="484" font-size="11.5" fill="#a16207">LayerNorm → FC 3,072→3,072</text>
+  <text x="490" y="502" font-size="11.5" fill="#a16207">→ GELU → FC 3,072→1,024</text>
+
+  <line x1="245" y1="262" x2="245" y2="546" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="655" y1="518" x2="655" y2="546" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+
+  <!-- ================= unified sequence ================= -->
+  <rect x="60" y="548" width="780" height="64" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-dasharray="0"/>
+  <text x="80" y="572" font-size="13" font-weight="600" fill="#0f172a">统一多模态 token 序列</text>
+  <text x="80" y="592" font-size="11.5" fill="#475569">图像/视频 token 与文本 token 早期融合进同一序列，以 &lt;|vision_start|&gt; &lt;|image_pad|&gt; &lt;|vision_end|&gt; 划界（id 248,053 / 248,056 / 248,054）</text>
+
+  <line x1="450" y1="612" x2="450" y2="636" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+
+  <!-- ================= decoder container ================= -->
+  <rect x="60" y="638" width="780" height="392" rx="10" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="80" y="664" font-size="14" font-weight="700" fill="#0f172a">解码器 · 24 层混合注意力</text>
+  <text x="80" y="686" font-size="12" fill="#475569">6 × [ 3 × ( Gated DeltaNet → FFN ) → 1 × ( Gated Attention → FFN ) ]</text>
+
+  <!-- 24 cells -->
+  <g font-size="9.5" font-weight="600" text-anchor="middle">
+    <rect x="80"  y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="94"  y="726" fill="#ffffff">L0</text>
+    <rect x="111" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="125" y="726" fill="#ffffff">L1</text>
+    <rect x="142" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="156" y="726" fill="#ffffff">L2</text>
+    <rect x="173" y="702" width="28" height="38" rx="3" fill="#1d4ed8"/><text x="187" y="726" fill="#ffffff">L3</text>
+    <rect x="204" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="218" y="726" fill="#ffffff">L4</text>
+    <rect x="235" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="249" y="726" fill="#ffffff">L5</text>
+    <rect x="266" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="280" y="726" fill="#ffffff">L6</text>
+    <rect x="297" y="702" width="28" height="38" rx="3" fill="#1d4ed8"/><text x="311" y="726" fill="#ffffff">L7</text>
+    <rect x="328" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="342" y="726" fill="#ffffff">L8</text>
+    <rect x="359" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="373" y="726" fill="#ffffff">L9</text>
+    <rect x="390" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="404" y="726" fill="#ffffff">10</text>
+    <rect x="421" y="702" width="28" height="38" rx="3" fill="#1d4ed8"/><text x="435" y="726" fill="#ffffff">11</text>
+    <rect x="452" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="466" y="726" fill="#ffffff">12</text>
+    <rect x="483" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="497" y="726" fill="#ffffff">13</text>
+    <rect x="514" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="528" y="726" fill="#ffffff">14</text>
+    <rect x="545" y="702" width="28" height="38" rx="3" fill="#1d4ed8"/><text x="559" y="726" fill="#ffffff">15</text>
+    <rect x="576" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="590" y="726" fill="#ffffff">16</text>
+    <rect x="607" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="621" y="726" fill="#ffffff">17</text>
+    <rect x="638" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="652" y="726" fill="#ffffff">18</text>
+    <rect x="669" y="702" width="28" height="38" rx="3" fill="#1d4ed8"/><text x="683" y="726" fill="#ffffff">19</text>
+    <rect x="700" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="714" y="726" fill="#ffffff">20</text>
+    <rect x="731" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="745" y="726" fill="#ffffff">21</text>
+    <rect x="762" y="702" width="28" height="38" rx="3" fill="#0f766e"/><text x="776" y="726" fill="#ffffff">22</text>
+    <rect x="793" y="702" width="28" height="38" rx="3" fill="#1d4ed8"/><text x="807" y="726" fill="#ffffff">23</text>
+  </g>
+
+  <!-- repeat bracket -->
+  <path d="M 80 750 L 80 760 L 821 760 L 821 750" fill="none" stroke="#94a3b8" stroke-width="1.2"/>
+  <text x="450" y="778" font-size="11.5" fill="#475569" text-anchor="middle">每 4 层为一个重复单元，共 6 个（×6）</text>
+
+  <!-- legend -->
+  <rect x="80" y="794" width="13" height="13" rx="2.5" fill="#0f766e"/>
+  <text x="99" y="805" font-size="11.5" fill="#334155">Gated DeltaNet 层 × 18</text>
+  <rect x="270" y="794" width="13" height="13" rx="2.5" fill="#1d4ed8"/>
+  <text x="289" y="805" font-size="11.5" fill="#334155">Gated Attention 层 × 6</text>
+  <rect x="470" y="794" width="13" height="13" rx="2.5" fill="#6d28d9"/>
+  <text x="489" y="805" font-size="11.5" fill="#334155">每层均接 SwiGLU FFN（1,024 → 3,584 → 1,024）</text>
+
+  <!-- per-layer residual schematic -->
+  <rect x="80" y="824" width="740" height="86" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="96" y="846" font-size="11.5" font-weight="600" fill="#334155">单层数据流（前置归一化 + 残差）</text>
+  <text x="96" y="868" font-size="11.5" fill="#475569" font-family="'DejaVu Sans Mono',monospace">h = h + TokenMixer( RMSNorm(h) )</text>
+  <text x="96" y="890" font-size="11.5" fill="#475569" font-family="'DejaVu Sans Mono',monospace">h = h + FFN( RMSNorm(h) )</text>
+  <text x="470" y="868" font-size="11.5" fill="#64748b">TokenMixer ∈ { Gated DeltaNet, Gated Attention }</text>
+  <text x="470" y="890" font-size="11.5" fill="#64748b">RMSNorm eps = 1e-6</text>
+
+  <text x="80" y="936" font-size="11.5" fill="#475569">混合设计：线性注意力层把长上下文的 KV 缓存压成固定大小的循环状态，只有 6 层需要保存完整 KV；线性层与全注意力层交错以保留精确检索能力。</text>
+  <text x="80" y="958" font-size="11.5" fill="#475569">位置编码：旋转维度 = 256 × 0.25 = 64，mRoPE 三分区 [11, 11, 10]（interleaved），θ = 10⁷。</text>
+  <text x="80" y="980" font-size="11.5" fill="#475569">上下文：262,144 token 原生训练，README 称可扩展至 ~1,010,000。</text>
+
+  <!-- ================= right column cards ================= -->
+  <!-- GDN -->
+  <rect x="870" y="196" width="510" height="266" rx="10" fill="#f0fdfa" stroke="#5eead4"/>
+  <text x="890" y="222" font-size="13.5" font-weight="700" fill="#115e59">Gated DeltaNet（线性注意力）· 18 层</text>
+  <text x="890" y="246" font-size="11.5" fill="#134e4a" font-family="'DejaVu Sans Mono',monospace">in_proj_qkv  1,024 → 6,144</text>
+  <text x="890" y="264" font-size="11" fill="#0f766e">16 个 QK 头 × 128 维 + 16 个 V 头 × 128 维</text>
+  <text x="890" y="288" font-size="11.5" fill="#134e4a" font-family="'DejaVu Sans Mono',monospace">ShortConv1d  6,144 通道, kernel = 4</text>
+  <text x="890" y="306" font-size="11" fill="#0f766e">深度可分离因果卷积，先做局部混合</text>
+  <text x="890" y="330" font-size="11.5" fill="#134e4a" font-family="'DejaVu Sans Mono',monospace">gated delta rule  chunk / recurrent</text>
+  <text x="890" y="348" font-size="11" fill="#0f766e">分块并行训练，逐 token 递推推理</text>
+  <text x="890" y="372" font-size="11.5" fill="#134e4a" font-family="'DejaVu Sans Mono',monospace">in_proj_b  1,024 → 16   (β)</text>
+  <text x="890" y="390" font-size="11.5" fill="#134e4a" font-family="'DejaVu Sans Mono',monospace">in_proj_a  1,024 → 16   (Δt)</text>
+  <text x="890" y="408" font-size="11" fill="#0f766e">A_log / dt_bias 各 16 个，按 float32 保存</text>
+  <text x="890" y="432" font-size="11.5" fill="#134e4a" font-family="'DejaVu Sans Mono',monospace">in_proj_z  1,024 → 2,048  (输出门)</text>
+  <text x="890" y="450" font-size="11" fill="#0f766e">RMSNormGated(128)：先归一化再乘 SiLU(z)</text>
+
+  <!-- Gated Attention -->
+  <rect x="870" y="478" width="510" height="238" rx="10" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="890" y="504" font-size="13.5" font-weight="700" fill="#1e3a8a">Gated Attention（全注意力 / GQA）· 6 层</text>
+  <text x="890" y="528" font-size="11.5" fill="#1e3a8a" font-family="'DejaVu Sans Mono',monospace">q_proj  1,024 → 4,096</text>
+  <text x="890" y="546" font-size="11" fill="#1d4ed8">= 8 头 × 256 维查询 + 8 头 × 256 维输出门</text>
+  <text x="890" y="570" font-size="11.5" fill="#1e3a8a" font-family="'DejaVu Sans Mono',monospace">k_proj / v_proj  1,024 → 512</text>
+  <text x="890" y="588" font-size="11" fill="#1d4ed8">仅 2 个 KV 头 × 256 维，8:2 分组查询</text>
+  <text x="890" y="612" font-size="11.5" fill="#1e3a8a" font-family="'DejaVu Sans Mono',monospace">q_norm / k_norm  256 维</text>
+  <text x="890" y="630" font-size="11" fill="#1d4ed8">对每个头做 RMSNorm 稳定注意力 logits</text>
+  <text x="890" y="654" font-size="11.5" fill="#1e3a8a" font-family="'DejaVu Sans Mono',monospace">attn_out = softmax(QKᵀ/√d) V ⊙ sigmoid(gate)</text>
+  <text x="890" y="672" font-size="11" fill="#1d4ed8">门控由 q_proj 的后半段输出直接生成</text>
+  <text x="890" y="694" font-size="11.5" fill="#1e3a8a" font-family="'DejaVu Sans Mono',monospace">o_proj  2,048 → 1,024</text>
+
+  <!-- FFN -->
+  <rect x="870" y="732" width="510" height="120" rx="10" fill="#f5f3ff" stroke="#c4b5fd"/>
+  <text x="890" y="758" font-size="13.5" font-weight="700" fill="#4c1d95">SwiGLU FFN · 每层各一个（共 24）</text>
+  <text x="890" y="782" font-size="11.5" fill="#4c1d95" font-family="'DejaVu Sans Mono',monospace">gate_proj / up_proj  1,024 → 3,584</text>
+  <text x="890" y="802" font-size="11.5" fill="#4c1d95" font-family="'DejaVu Sans Mono',monospace">down_proj           3,584 → 1,024</text>
+  <text x="890" y="824" font-size="11" fill="#6d28d9">稠密 MLP：配置中无专家路由参数，本尺寸不做 MoE</text>
+  <text x="890" y="842" font-size="11" fill="#6d28d9">FFN 占总参数 30.3%，是单一最大模块</text>
+
+  <!-- MTP -->
+  <rect x="870" y="868" width="510" height="162" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-dasharray="5 4"/>
+  <text x="890" y="894" font-size="13.5" font-weight="700" fill="#334155">MTP 多 token 预测模块（附属）</text>
+  <text x="890" y="918" font-size="11.5" fill="#475569" font-family="'DejaVu Sans Mono',monospace">mtp.pre_fc_norm_{embedding, hidden}  1,024×2</text>
+  <text x="890" y="938" font-size="11.5" fill="#475569" font-family="'DejaVu Sans Mono',monospace">mtp.fc  2,048 → 1,024</text>
+  <text x="890" y="958" font-size="11.5" fill="#475569" font-family="'DejaVu Sans Mono',monospace">mtp.layers.0  1 层全注意力解码层</text>
+  <text x="890" y="978" font-size="11.5" fill="#475569" font-family="'DejaVu Sans Mono',monospace">mtp.norm  1,024</text>
+  <text x="890" y="1000" font-size="11" fill="#64748b">共 20.45M 参数（2.3%）。训练时作为额外预测头；</text>
+  <text x="890" y="1018" font-size="11" fill="#64748b">推理加载时被忽略（权重名 ^mtp.* 不加载）。</text>
+
+  <!-- param composition card -->
+  <rect x="870" y="1046" width="510" height="164" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="890" y="1072" font-size="13.5" font-weight="700" fill="#0f172a">参数分布（共 873.4M）</text>
+  <rect x="890" y="1086" width="470" height="20" rx="4" fill="#e2e8f0"/>
+  <rect x="890" y="1086" width="142.1" height="20" fill="#6d28d9"/>
+  <rect x="1032.1" y="1086" width="136.8" height="20" fill="#4f46e5"/>
+  <rect x="1168.9" y="1086" width="102.1" height="20" fill="#0f766e"/>
+  <rect x="1271.0" y="1086" width="54.1" height="20" fill="#d97706"/>
+  <rect x="1325.1" y="1086" width="23.7" height="20" fill="#1d4ed8"/>
+  <rect x="1348.8" y="1086" width="11.2" height="20" rx="4" fill="#be185d"/>
+
+  <rect x="890" y="1118" width="10" height="10" rx="2" fill="#6d28d9"/><text x="906" y="1128" font-size="10.5" fill="#475569">FFN 264.2M · 30.3%</text>
+  <rect x="1100" y="1118" width="10" height="10" rx="2" fill="#4f46e5"/><text x="1116" y="1128" font-size="10.5" fill="#475569">词嵌入 254.3M · 29.1%</text>
+  <rect x="890" y="1144" width="10" height="10" rx="2" fill="#0f766e"/><text x="906" y="1154" font-size="10.5" fill="#475569">Gated DeltaNet 189.8M · 21.7%</text>
+  <rect x="1100" y="1144" width="10" height="10" rx="2" fill="#d97706"/><text x="1116" y="1154" font-size="10.5" fill="#475569">视觉塔 100.6M · 11.5%</text>
+  <rect x="890" y="1170" width="10" height="10" rx="2" fill="#1d4ed8"/><text x="906" y="1180" font-size="10.5" fill="#475569">Gated Attention 44.0M · 5.0%</text>
+  <rect x="1100" y="1170" width="10" height="10" rx="2" fill="#be185d"/><text x="1116" y="1180" font-size="10.5" fill="#475569">MTP 20.5M · 2.3%</text>
+
+  <!-- ================= final norm / output ================= -->
+  <line x1="450" y1="1030" x2="450" y2="1056" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+  <rect x="60" y="1058" width="780" height="46" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="80" y="1087" font-size="12.5" fill="#0f172a">Final RMSNorm 1,024 → LM Head（与 Token Embedding 共享权重）→ logits 248,320</text>
+
+  <line x1="450" y1="1104" x2="450" y2="1130" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+  <rect x="60" y="1132" width="780" height="46" rx="8" fill="#fdf2f8" stroke="#f9a8d4"/>
+  <text x="80" y="1161" font-size="12.5" fill="#9d174d">下一个 token 的 next-token 分布（Base 模型：仅续写，未经指令对齐）</text>
+
+  <!-- footnote -->
+  <line x1="60" y1="1204" x2="1380" y2="1204" stroke="#e2e8f0"/>
+  <text x="60" y="1228" font-size="10.5" fill="#94a3b8">依据：本机 /home/dev/models/Qwen3.5-0.8B-Base/config.json、model.safetensors 张量形状与 transformers 5.20.2 的 modeling_qwen3_5.py 核对得出。</text>
+  <text x="60" y="1248" font-size="10.5" fill="#94a3b8">特殊 token：eos 248,044 · vision_start 248,053 · vision_end 248,054 · image_pad 248,056 · video_pad 248,057。</text>
+  <text x="60" y="1268" font-size="10.5" fill="#94a3b8">L 编号为层索引；蓝层为 3/7/11/15/19/23。视觉 token 经 merger 投影到 1,024 维后，按占位 token 的位置填入序列，与文本嵌入拼接（非相加）后送入解码器。</text>
+</svg>

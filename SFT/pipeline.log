@@ -1,0 +1,82 @@
+Wed Nov 18 05:33:09 PM CST 2026 pipeline started
+Wed Nov 18 05:33:09 PM CST 2026 pipeline started
+Wed Nov 18 05:33:09 PM CST 2026 waiting for maze SFT...
+Wed Nov 18 05:33:09 PM CST 2026 waiting for maze SFT...
+Wed Nov 18 05:33:09 PM CST 2026 waiting for sudoku SFT...
+Wed Nov 18 05:33:09 PM CST 2026 waiting for sudoku SFT...
+Wed Nov 18 05:48:09 PM CST 2026 pipeline started
+Wed Nov 18 05:48:09 PM CST 2026 pipeline started
+Wed Nov 18 05:48:09 PM CST 2026 wave1: maze SFT GPU0 + sudoku SFT GPU1
+Wed Nov 18 05:48:09 PM CST 2026 wave1: maze SFT GPU0 + sudoku SFT GPU1
+Wed Nov 18 06:07:51 PM CST 2026 wave1 done
+Wed Nov 18 06:07:51 PM CST 2026 wave1 done
+Wed Nov 18 06:07:51 PM CST 2026 wave2: countdown SFT GPU0 + arc SFT GPU1
+Wed Nov 18 06:07:51 PM CST 2026 wave2: countdown SFT GPU0 + arc SFT GPU1
+Wed Nov 18 06:32:17 PM CST 2026 wave2 done
+Wed Nov 18 06:32:17 PM CST 2026 wave2 done
+Wed Nov 18 06:32:17 PM CST 2026 drafter wave1: maze+sudoku gen
+Wed Nov 18 06:32:17 PM CST 2026 drafter wave1: maze+sudoku gen
+Wed Nov 18 06:32:17 PM CST 2026 [maze] gen drafter data on GPU0
+Wed Nov 18 06:32:17 PM CST 2026 [maze] gen drafter data on GPU0
+Wed Nov 18 06:32:17 PM CST 2026 [sudoku] gen drafter data on GPU1
+Wed Nov 18 06:32:17 PM CST 2026 [sudoku] gen drafter data on GPU1
+Wed Nov 18 06:32:22 PM CST 2026 [maze] gen done
+Wed Nov 18 06:32:22 PM CST 2026 [maze] gen done
+Wed Nov 18 06:32:22 PM CST 2026 [sudoku] gen done
+Wed Nov 18 06:32:22 PM CST 2026 [sudoku] gen done
+Wed Nov 18 06:32:22 PM CST 2026 maze+sudoku gen done, starting drafter train
+Wed Nov 18 06:32:22 PM CST 2026 maze+sudoku gen done, starting drafter train
+Wed Nov 18 06:32:22 PM CST 2026 [maze] training drafter on GPU0 -> /home/dev/KAP/parameter/draft/dspark_maze_sft
+Wed Nov 18 06:32:22 PM CST 2026 [maze] training drafter on GPU0 -> /home/dev/KAP/parameter/draft/dspark_maze_sft
+Wed Nov 18 06:32:22 PM CST 2026 [sudoku] training drafter on GPU1 -> /home/dev/KAP/parameter/draft/dspark_sudoku_sft
+Wed Nov 18 06:32:22 PM CST 2026 [sudoku] training drafter on GPU1 -> /home/dev/KAP/parameter/draft/dspark_sudoku_sft
+Wed Nov 18 06:32:50 PM CST 2026 [maze] drafter done, best tau=
+Wed Nov 18 06:32:50 PM CST 2026 [maze] drafter done, best tau=
+Wed Nov 18 06:32:51 PM CST 2026 [sudoku] drafter done, best tau=
+Wed Nov 18 06:32:51 PM CST 2026 [sudoku] drafter done, best tau=
+Wed Nov 18 06:32:51 PM CST 2026 maze+sudoku drafter wave1 done
+Wed Nov 18 06:32:51 PM CST 2026 maze+sudoku drafter wave1 done
+Wed Nov 18 06:32:51 PM CST 2026 drafter wave2: countdown+arc gen
+Wed Nov 18 06:32:51 PM CST 2026 drafter wave2: countdown+arc gen
+Wed Nov 18 06:32:51 PM CST 2026 [countdown] gen drafter data on GPU0
+Wed Nov 18 06:32:51 PM CST 2026 [countdown] gen drafter data on GPU0
+Wed Nov 18 06:32:51 PM CST 2026 [1d_arc] gen drafter data on GPU1
+Wed Nov 18 06:32:51 PM CST 2026 [1d_arc] gen drafter data on GPU1
+Wed Nov 18 06:32:55 PM CST 2026 [countdown] gen done
+Wed Nov 18 06:32:55 PM CST 2026 [countdown] gen done
+Wed Nov 18 06:32:56 PM CST 2026 [1d_arc] gen done
+Wed Nov 18 06:32:56 PM CST 2026 [1d_arc] gen done
+Wed Nov 18 06:32:56 PM CST 2026 countdown+arc gen done, starting drafter train
+Wed Nov 18 06:32:56 PM CST 2026 countdown+arc gen done, starting drafter train
+Wed Nov 18 06:32:56 PM CST 2026 [countdown] training drafter on GPU0 -> /home/dev/KAP/parameter/draft/dspark_countdown_sft
+Wed Nov 18 06:32:56 PM CST 2026 [countdown] training drafter on GPU0 -> /home/dev/KAP/parameter/draft/dspark_countdown_sft
+Wed Nov 18 06:32:56 PM CST 2026 [1d_arc] training drafter on GPU1 -> /home/dev/KAP/parameter/draft/dspark_arc_sft
+Wed Nov 18 06:32:56 PM CST 2026 [1d_arc] training drafter on GPU1 -> /home/dev/KAP/parameter/draft/dspark_arc_sft
+Wed Nov 18 06:33:21 PM CST 2026 [countdown] drafter done, best tau=
+Wed Nov 18 06:33:21 PM CST 2026 [countdown] drafter done, best tau=
+Wed Nov 18 06:33:21 PM CST 2026 [1d_arc] drafter done, best tau=
+Wed Nov 18 06:33:21 PM CST 2026 [1d_arc] drafter done, best tau=
+Wed Nov 18 06:33:21 PM CST 2026 FULL PIPELINE COMPLETE
+Wed Nov 18 06:33:21 PM CST 2026 FULL PIPELINE COMPLETE
+
+
+Target models:
+Target models:
+HF model saved.
+HF model saved.
+HF model saved.
+HF model saved.
+HF model saved.
+HF model saved.
+HF model saved.
+HF model saved.
+Draft models:
+Draft models:
+done 0 s  best tau_paper -1.0
+done 0 s  best tau_paper -1.0
+done 0 s  best tau_paper -1.0
+done 0 s  best tau_paper -1.0
+done 0 s  best tau_paper -1.0
+done 0 s  best tau_paper -1.0
+done 0 s  best tau_paper -1.0
+done 0 s  best tau_paper -1.0

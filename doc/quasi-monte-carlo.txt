@@ -1,0 +1,1393 @@
+QuasiMoTTo: Quasi-Monte Carlo Test-Time Scaling
+Michael Y. Li*
+Stanford University
+Anthony Zhan*
+Stanford University
+Kanishk Gandhi
+Stanford University
+Noah D. Goodman
+Stanford University
+Emily B. Fox
+Stanford University
+Abstract
+Scaling inference compute, by generating many parallel attempts per problem, is a costly but reliable lever
+for improving language model capabilities. By default these attempts are generated independently, wasting
+inference compute on redundant solutions. This waste seems unavoidable. After all, independence is what
+makes parallel sampling trivial to scale. However, this tradeoff is not fundamental: there is a rich design
+space of samplers that generate correlated but exact samples entirely in parallel. We explore this design space
+as an avenue for improving sample efficiency in scaling inference compute and reinforcement learning (RL).
+Concretely, we introduce QuasiMoTTo, which uses correlated samples as a drop-in replacement for i.i.d. samples.
+To generate these samples, QuasiMoTTo uses a reparameterization of autoregressive sampling as inverse-CDF
+sampling and draws the underlying uniforms with quasi-Monte Carlo (QMC); because QMC spreads the
+uniforms out more evenly than i.i.d., the resulting samples cover the output space with far less redundancy.
+Even though the batch is correlated, each sample is marginally distributed according to the language model,
+so we can use the batch for policy-gradient training. Our empirical analysis focuses on understanding
+how efficiently QuasiMoTTo can turn compute into performance. To evaluate correlated samplers, whose
+dependence breaks standard pass@k estimators, we first develop an unbiased bootstrap estimator. Across four
+reasoning benchmarks, QuasiMoTTo matches i.i.d. pass@k accuracy with 25–47% fewer samples. Strikingly,
+QuasiMoTTo often saturates an upper bound on pass@k that holds for any marginal-preserving sampler. We
+also apply QuasiMoTTo to policy-gradient RL (GRPO) where it matches i.i.d. performance with 50% fewer
+training steps. These gains come from higher coverage, which yields a stronger learning signal per batch.
+1 Introduction
+Parallel sampling, generating k independent (i.i.d.) attempts per prompt, is a fundamental primitive
+in inference compute scaling and reinforcement learning (RL). But independence is wasteful: many
+samples in a batch visit the same high-probability regions. This redundancy is costly. In test-time
+scaling, ideally each sample would explore a different approach, but independent samples rediscover
+the same solutions; therefore, finding a correct solution to a hard problem can require a very large
+k. In RL, the same redundancy can force large group sizes because methods like GRPO [11] need
+within-group reward variation to produce a learning signal. Reducing this redundancy can mitigate
+the steep cost of methods that scale inference compute, which are driving tremendous progress in
+language model (LM) capabilities [23].
+* Equal contribution. Correspondence to michaelyli@stanford.edu.
+1
+arXiv:2607.01179v1 [cs.LG] 1 Jul 2026
+
+(a) Parallel sampling with independent samples
+0 1
+×3 ×2i.i.d samples clump together
+prompt
+make 24
+from 3,7,8
+To make 24,
+multiply 3 × 8 = 24
+multiply 3 × 8 = 24
+multiply 3 × 8 = 24
+subtract 8 − 3 = 5
+subtract 8 − 3 = 5
+2 distinct
+chains
+(b) Parallel sampling with dependent samples (QuasiMoTTO)
+0 1
+correlated samples have higher coverage
+prompt
+make 24
+from 3,7,8
+To make 24,
+multiply 3 × 8 = 24
+add
+7 + 8 = 15
+3 + 8 = 11
+factor 24=8·3 check 7
+subtract 8 − 3 = 5
+5 distinct
+chains
+(c) Decoding uniforms to sequences in parallel via trie traversal
+0 1
+u1 u2
+coupled uniform samples
+multiply add factor sub πθ (x1)
+width = πθ (add)
+7+8 3+8 8·3 . . .πθ (x2 | add) πθ (x2 | factor)
+=15 . . . ck7 . . .πθ (x3 | add 7+8) πθ (x3 | factor 8·3)
+u1 → add 7+8 =15 . . .
+u2 → factor 24=8·3 check 7 . . .
+width = πθ (add 7+8 =15)
+(d) QuasiMoTTo significantly boosts sample-efficiency.20 40 60 80
+target pass@k
+60%
+80%
+100%
+Reduction in samples i.i.d.
+Inference efficiency
+47% fewer samples
+QuasiMoTTo
+0.04 0.05 0.06
+target pass@1
+60%
+80%
+100%
+Reduction in RL steps i.i.d.
+RL training efficiency
+51% fewer RL steps
+Sudoku
+Figure 1: Dependent samples for inference compute scaling and RL. (a) Inference compute scaling
+and RL rely on independent (i.i.d) sampling, which wastes compute generating redundant solutions.
+(b) QuasiMoTTo explores the design space of correlated samplers that cover the output space more
+evenly than i.i.d.; each individual sample remains an exact sample from the language model (LM).
+(c) Sampling is embarrassingly parallel via arithmetic sampling [31], which maps each sequence to a subinterval of [0, 1]. Generation is a recursive inverse-CDF procedure akin to traversing a probabilityweighted trie: for sample i, we draw ui ∈ [0, 1], and at each step partition the current interval (a
+prefix) into next-token bins whose widths are the LM’s next-token probabilities, descending into
+the bin containing ui. The k samples are coupled only through the uniforms drawn upfront: each
+is an independent traversal of the same trie, steered by its own ui, so generation is parallel. (d)
+QuasiMoTTo significantly boosts sample-efficiency in test-time scaling and RL.
+Intuitively, we could reduce redundancy by correlating these samples so that they depend on each
+other. We could correlate these samples sequentially — conditioning each draw on the previous
+ones — but this forfeits the parallelism that makes independent sampling simple to scale. Parallel
+alternatives either distort the LM’s next-token distribution [15, 30], biasing the estimates RL depends
+on, or exploit its sensitivity to the prompt [22], where any increase in coverage is incidental rather
+than guaranteed.
+We observe that there is a rich design space of sampling methods that can generate correlated
+samples that decode completely in parallel yet remain exact samples from the LM [31]. We explore
+this design space in QuasiMoTTo, which replaces i.i.d. samples with these dependent samples
+in inference compute scaling and RL. To do this, QuasiMoTTo leverages Monte Carlo methods
+and coding theory, building on recent work on arithmetic sampling [27, 31]. Instead of drawing
+samples independently, we generate samples that repel one another to cover the output distribution
+more efficiently [25]. Concretely, we first use randomized Quasi-Monte Carlo (QMC) to generate
+k samples in the unit interval that are more evenly spread than i.i.d. uniform samples. We then
+map these to k LM samples via arithmetic coding [19]. Even though samples are coordinated to x1
+−3
+−2
+−1
+0
+1
+2
+3
+x2
+independent
+−3 −2 −1 0 1 2 3
+x1
+−3
+−2
+−1
+0
+1
+2
+3
+x2
+dependent with same marginalsFigure 2: Same marginals, different joints. Two distributions over (x1, x2) with identical marginals
+(see histograms) but different dependence structure: independent (left) versus negatively correlated
+(right). Since we often only need to preserve marginals, we can exploit this flexibility to generate
+LM rollouts that are correlated in a way that better covers the output space.
+boost coverage, the procedure is both embarrassingly parallel and exact: each rollout is distributed
+exactly as if it had been sampled i.i.d. from the LM. Generation is parallel because the arithmetic
+coding parameterization of autoregressive sampling reduces sampling a sequence to pushing a
+single uniform through the LM’s inverse CDF: once we draw a batch of uniforms upfront, each
+rollout decodes independently, with no communication across rollouts. The procedure produces
+exact LM samples because QMC guarantees each sample marginally uniform, even though samples
+are correlated. This ensures inverse-CDF sampling [32] produces an exact draw from the LM.
+The goal of using dependent samples is to improve sample efficiency: fewer samples give the same
+performance. We therefore evaluate QuasiMoTTo with a focus on understanding whether we can
+generate fewer samples from an LM to get the same performance as i.i.d. sampling in test-time
+scaling and RL. (1) Test-time scaling. To measure how much more coverage QuasiMoTTo provides
+for fixed k, we compare its pass@k on reasoning tasks relative to i.i.d. sampling. To characterize the
+best possible performance, we compare against a union-bound ceiling reflecting the best pass@k
+achievable by any marginal-preserving sampler. Strikingly, on reasoning benchmarks, QuasiMoTTo
+nearly saturates this ceiling, leaving little room for any marginal-preserving sampler to perform
+better. (2) Reinforcement learning. Because our sampler produces exact samples from the LM,
+it integrates directly into RL pipelines like GRPO. We show that using QuasiMoTTo reduces the
+number of training steps required to achieve a target performance relative to i.i.d. sampling.
+2 QuasiMoTTo
+2.1 Setup
+A common motif in language modeling is drawing a batch of k samples {τi}k
+i=1 from a model πθ
+and aggregating over them. GRPO estimates the policy gradient by averaging over a sampled group
+of responses; test-time scaling produces a final answer by combining parallel attempts. In each case
+the batch is a finite-sample approximation to πθ, and we want it to be (1) marginally correct—each τi
+distributed according to πθ—and (2) high-coverage—spread across the model’s support rather than
+clumped on a few modes. The key observation is that correctness asks only for the right marginals,
+which leaves the joint free; there is a large space of samplers that design the joint distribution in a
+way that improves coverage.
+
+In particular, marginal correctness is all that average-type estimators need. Let μ be the joint law of
+the batch (τ1, . . . , τk) and μi its i-th marginal. For any per-rollout quantity h,
+Eμ
+"
+1
+k
+kX
+i=1
+h(τi)
+#
+= 1
+k
+kX
+i=1
+Eτi∼μi [h(τi)] = Eτ ∼πθ [h(τ )] ,
+where the first equality is linearity of expectation and holds for any joint μ, and the second uses
+only the marginal condition μi = πθ. The vanilla policy-gradient estimator with no baselines
+(h(τ ) = ∇ log πθ(τ ) R(τ )) is one such average. A marginally correct sampler is therefore a drop-in
+replacement for i.i.d. in every estimator of this form. The i.i.d. default corresponds to the product
+law μ = π⊗k
+θ , but that is only one joint among the many that share the marginals μi = πθ. Two
+distributions can agree on their marginals and still have substantially different joint distributions—
+Figure 2 illustrates this for Gaussians. Another intuitive example is an antithetic pair. If we draw
+u ∼ Unif[0, 1], then the tuple (u, 1 − u) has uniform marginals, by symmetry, but the coordinates are
+negatively correlated.
+We can exploit this flexibility to design the joint distribution in a way that boosts coverage. This can
+often have beneficial effects on post-training. For example, policy gradient-based RL methods like
+GRPO benefit from higher coverage, since there is only a non-zero gradient signal when at least one
+of the attempts in a group is correct.
+The construction has two parts: a randomized Quasi-Monte Carlo coupling on Unif[0, 1] that induces
+the dependence (§2.2), and arithmetic coding [19, 31] that maps those uniforms to exact samples
+from πθ, preserving the marginals by construction (§2.3).
+2.2 Generating dependent samples via Quasi-Monte Carlo
+Randomized Quasi-Monte Carlo (QMC) is a technique to generate dependent samples with target
+marginals. Instead of k independent points, it constructs k low-discrepancy points that cover the space
+more evenly than i.i.d. sampling, while ensuring each point is marginally uniform. We describe a
+number of different methods for doing this below. This marginally uniform property is crucial. In
+particular, for the inverse CDF sampling in Section 2.3 to be correct (i.e., each completion is an exact
+draw from the LM), the samples must be marginally uniform. For a visualization of these methods,
+see Figure 11.
+Lattice This procedure involves placing k points on the regular grid {0, 1/k, . . . , (k−1)/k}, drawing
+a single shared offset ∆ ∼ Unif[0, 1], giving
+Ui =
+ i−1
+k + ∆
+
+mod 1, i = 1, . . . , k.
+This operation wraps points randomly along the unit interval. Even though the {Ui}k
+i=1 are more
+spread-out by construction, the marginal distribution of each Ui is exactly Unif[0, 1] due to the
+random shift. To see this, it is useful to think of this procedure as producing points on the unit circle:
+defining the endpoints as 0 and 1 turns [0, 1] into a circle with circumference one, and the mod 1
+operation is exactly a rotation that wraps points around it. The k grid points sit at evenly spaced
+positions on the circle, and ∆ rotates the entire configuration by a uniformly random angle. Because
+∆ is a uniform random shift, each grid point i/k — viewed individually — is rotated to a uniformly
+random location on the circle, so Ui ∼ Unif[0, 1] marginally.
+Stratified Instead of using a fixed-width grid, we can also divide the interval [0, 1] into k equally
+sized strata and draw one point per stratum:
+Ui ∼ Unif  i−1
+k , i
+k
+ i = 1, . . . , k.
+
+Find all zeros in the indicated finite field of the given polynomial
+with coefficients in that field. x5 + 3x3 + x2 + 2x in Z5
+A. 0 B. 1 C. 0, 1 D. 0, 4
+1. Logits
+logits = πθ ( · | x<t)
+2. Sort descending
+σ = argsort(logits)
+3. CDF on [0, 1]
+xt = σ[min{j : Fj ≥ u}]
+A B C D D
+.40 A
+.30 C
+.20 B
+.10
+D
+A
+C
+B
+0
+.40
+.70
+.90
+1
+u = .31
+xt = “D”
+Figure 3: Exact sampling from the LM using inverse-CDF sampling. The LM produces logits
+over the answer choices. We sort them in descending order to yield a permutation σ and a sorted
+probability vector (panel 2). Stacking these probabilities partitions the unit interval into bins whose
+widths equal the token probabilities; a uniformly random point lands in each bin with probability
+equal to that token’s mass. To sample a token, we first sample u ∈ [0, 1) and find the token whose
+interval contains it. u = .31 falls in [0, .40), returning xt = “D” (panel 3). For illustrative purposes,
+we show decoding a single token but repeating this process yields an entire sequence. This recovers
+the same distribution as standard autoregressive sampling, which usually uses Gumbel-max.
+This stratification ensures that no two samples can occupy the same subinterval. We then permute
+the resulting samples {Ui}k
+i=1 so that each Ui is marginally distributed according to Unif[0, 1].
+The aforementioned QMC methods operate over the 1D space [0, 1]. In the next section, we describe
+a procedure for mapping these 1D points to sequences using arithmetic coding. Before doing so, we
+also present a third QMC method that operates in a higher dimensional space, bypassing the need
+for this procedure.
+Token-level Sobol Since we care about sampling token sequences, a natural approach is to
+incorporate the sequence dimension directly into the QMC space itself. Concretely, for sequence
+length n, we can produce uniform random variables U ∈ [0, 1]n by using Sobol sequences [28]. Under
+this construction, the j-th coordinate of the point U corresponds to the j-th token position, so we can
+decode by simply passing Uj through the inverse CDF (Figure 3) and iterating. Points that collectively
+cover [0, 1]n should thus produce LLM samples that collectively cover the model’s distribution over
+sequences. We refer readers to e.g. PyTorch’s open-source SobolEngine implementation for the
+actual technical details of constructing {Ui}k
+i=1.
+We provide visual and intuitive comparisons for these three QMC methods in Section 4.3 alongside
+empirical results in Section 4.1.
+2.3 From uniform random variables to token sequences via arithmetic coding
+Randomized QMC gives us a method of sampling points in the unit interval that are (marginally)
+uniformly distributed but more evenly spread than i.i.d. samples. In particular, lattice and stratified sampling give us 1D samples U ∈ [0, 1]. To map these into token sequences distributed according to
+the LM’s autoregressive distribution πθ, we use arithmetic coding. The key property of arithmetic
+coding is that it represents token sequences as sub-intervals on the unit interval whose lengths
+are equal to the sequence probabilities. So, provided each point is uniformly sampled, it lands in a
+sub-interval with probability exactly equal to the probability the LM assigns to generating that
+sequence. This property enables us to decode a set of QMC points into token sequences that are
+distributed according to πθ.
+More formally, we construct a measure-preserving map from the unit interval to strings Φ : [0, 1] →
+V∗: a map with the property that if U ∼ Unif[0, 1], Φ(U ) is distributed exactly according to πθ. By
+pushing marginally uniform QMC samples through Φ, we can therefore get k exact samples from
+the language model. Below, we describe this in more detail.
+Arithmetic coding. We construct a map based on arithmetic coding [3, 19, 31], a classic idea from
+coding theory; we adapt the construction from Vilnis et al. [31]. Arithmetic coding represents
+sequences as nested partitions of the unit interval. We describe how sub-intervals are mapped to
+sequences via a recursive procedure. We start with [0, 1] and partition it into bins whose widths are
+the first-token probabilities πθ(x1), for x1 ∈ V. If u falls in the bin for x1, then x1 is the first token.
+We then recurse inside that bin: the bin for x1 is partitioned into sub-bins whose relative widths are
+given by πθ(· | x1), so that the sub-bin for x2 has width πθ(x1) πθ(x2 | x1).
+Continuing this process, each prefix x1:t is assigned an interval I(x1:t) ⊆ [0, 1] of length |I(x1:t)| =
+πθ(x1:t). These intervals form a prefix tree: the interval for a prefix contains sub-intervals corresponding to all possible one-token continuations. Sampling a full sequence amounts to drawing a
+single u ∼ Unif[0, 1] and traversing the tree to a leaf node, by following the unique chain of nested
+intervals containing u; see Figure 1. Since the interval for each sequence has length equal to its
+probability under πθ, the resulting sequence is distributed exactly according to the language model,
+provided the samples are marginally uniform.
+Generating a sequence via descending the tree: a numerically stable implementation. Evaluating
+Φ(u) means finding the leaf interval containing u. To do this, we descend the tree one token at a
+time, selecting a child via inverse CDF sampling using the language model next-token distribution.
+A naive approach tracks the prefix intervals at each step I(x1:t) and checks which sub-bucket u
+belongs to; this is not numerically stable, since this involves representing the raw probability πθ(x1:t).
+Conveniently, we can avoid representing the interval lengths explicitly, by carrying only the position
+of u relative to the current interval. Let ut ∈ [0, 1] be that coordinate after prefix x<t, with u1 = u. At
+each step the conditional πθ(· | x<t) partitions [0, 1] into one bucket per token; we select the bucket
+containing ut by an inverse-CDF lookup (Figure 3),
+xt = F −1
+t (ut | x<t), Ft(v | x<t) = X
+v′≤v
+πθ(v′ | x<t),
+We then rescale that bucket [ℓt, ℓt + pt), with pt = πθ(xt | x<t), back to the unit interval,
+ut+1 = ut − ℓt
+pt
+, (1)
+giving the local coordinate for the next conditional. Every step is then a categorical draw followed
+by an affine rescaling. The selection reads the same logits already used for softmax decoding, so
+the procedure folds into a standard autoregressive sampler at negligible cost; only the running
+coordinate ut is added as state. Because this coordinate is the sole per-sample state, the k rollouts
+can run as k independent autoregressive decodes that never interact; generation is as parallelizable
+as ordinary i.i.d. sampling.
+
+Estimating pass@4 from pass@8 via dyadic bootstrap
+pass@8
+sample
+pass@4
+bootstrap sample 1
+pass@4
+bootstrap sample 2
+Figure 4: Bootstrapped QMC pass@k estimator. Because the k samples are dependent rather than
+i.i.d. draws, the standard pass@k estimator is invalid; instead, we exploit that any stride-2 subsample
+is itself a valid pass@k/2 lattice. Stride 2 admits two starting offsets, each yielding an unbiased
+pass@4 estimate from the same pass@8 rollout. This generalizes to larger strides.
+2.4 Estimators that depend on the joint
+Section 2.1 showed that for average-type estimators, dependent samples are drop-in replacements
+for i.i.d. samples. But not every quantity computed from a batch can be expressed in this way and
+some commonly used estimators do rely on independence. This section discusses how to modify
+these estimators to account for dependent samples. More broadly, these case studies point to general
+recipes for retrofitting estimators built on independence so they remain valid — and unbiased —
+under dependent samples.
+2.4.1 Dyadic bootstrap estimator of pass@k.
+The typical way of estimating pass@k involves an unbiased estimator introduced in [2]: the procedure draws N ≥ k samples, counts the number c that are correct, and computes the closed
+form
+\pass@k = 1 −
+ N −c
+k
+
+ N
+k
+ ,
+the fraction of size-k subsets that contain at least one correct sample. This avoids having to draw
+repeated size-k batches. This closed form solution is valid when samples are independent and cannot
+be applied directly to our QuasiMoTTo samplers. For lattice sampling, we develop an analogous
+dyadic bootstrap estimator that subsamples a batch of N responses in a way that exploits the lattice
+structure to produce unbiased estimates.
+Theorem 1. Correctness of dyadic bootstrap sampling. Let k = 2L, and let
+ui =
+
+∆ + i
+k
+
+mod 1, i = 0, . . . , k − 1,
+where ∆ ∼ Unif[0, 1]. For any x ≤ L, set m = k/2x. Then each stride-2x subsequence
+u(r)
+j := ur+2xj , j = 0, . . . , m − 1,
+with r ∈ {0, . . . , 2x − 1}, is distributed exactly as a fresh randomly shifted lattice of size m. Consequently,
+each such subsequence gives an unbiased pass@m estimate under the randomized-lattice construction.
+Proof sketch. The full proof is given in Appendix A.3 and the intuition is captured in Figure 4; the
+key observation is that the stride-2x subsequence is a (random) lattice with spacing 1/m, plus a
+deterministic shift. Because a randomly-shifted lattice is invariant under deterministic shifts modulo
+1, the subsequence is distributed as a randomly-shifted m-point lattice.
+
+ℓi
+ℓj ri
+rj
+min(ℓi, ℓj ) + min(ri, rj )
+Figure 5: The joint probability of two sequences is determined by the intersection of intervals whose
+endpoints correspond to the relative positions of each sampled uniform within its final arithmetic
+interval. Shown is the no-wrap case; there is also a wrap-around case (Fig. 15).
+By similarly exploiting the structure of the stratified and Sobol samplers, we can also derive bootstrap
+pass@k estimators for these methods, which we present in Appendix A.3.
+2.4.2 RLOO estimators.
+The second estimator is the leave-one-out estimator used by RLOO. This approach is only unbiased
+when the baseline is independent of the samples, which is violated under dependent samples.
+Concretely, for each sample yi, RLOO computes an advantage by subtracting the mean reward of
+the other group members from the raw reward r(yi),
+Ai = r(yi) − 1
+n − 1
+X
+j̸ =i
+r(yj ),
+and the resulting gradient 1
+n
+P
+i Ai sθ(yi) is an unbiased policy gradient where sθ(yi) is the score
+∇θ log πθ(yi). The unbiasedness of this estimator relies on independence in a subtle way: under
+i.i.d. draws the baseline 1
+n−1
+P
+j̸ =i r(yj ) is independent of yi, and thus si, so it is mean-zero in
+expectation. Under QMC, we do not have this independence and using dependent samples with
+RLOO introduces bias via the baseline. Empirically, we find this has a negligible impact, but for
+completeness we describe how we might correct for this theoretically.
+A pairwise characterization of RLOO that admits an importance sampling correction. We could
+take an importance sampling approach to correct for this following Dimitriev and Zhou [6]. The
+key idea is to rewrite RLOO as a product-of-differences (PoD) estimator. Proposition 1 shows that
+RLOO is an average of pairwise PoD terms,
+gRLOO = 1
+n(n − 1)
+X
+i̸=j
+1
+2
+ r(yi) − r(yj ) sθ(yi) − sθ(yj ), (2)
+each of which is an expectation over the pair (yi, yj ) with respect to the independent product measure
+πθ ⊗ πθ.
+However, under a coupled sampler, the pair is drawn from the joint law qij instead. The PoD
+estimator makes it clear that an importance sampling correction involving pairs of sequences can
+yield unbiased estimates, if we can evaluate qij and the importance ratio is defined. Concretely,
+reweighting each term in Equation 2 by
+ρij (yi, yj ) = πθ(yi)πθ(yj )
+qij (yi, yj ) samples k
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+pass@k
+i.i.d. sample efficiency falls short of theoretical upper bound
+upper bound min(pk, 1)
+i.i.d. 1 − (1 − p)kFigure 6: i.i.d. sampling falls short of the per-problem pass@k upper bound. For a problem with
+pass@1 probability p, the union bound gives a ceiling of min(pk, 1) (black) that places an upper
+bound on any sampler with target marginals. The i.i.d. curve 1−(1−p)k (coral) lies strictly below this
+ceiling; the shaded gap represents the redundancy of independent sampling. Carefully constructed
+dependent samples can close the gap by being more spread out over the output space.
+maps each term’s expectation back to the independent product measure; by linearity of expectation,
+the reweighted average is therefore an unbiased RLOO gradient. The entire correction thus reduces
+computing the probability that the coupled sampler produces a given pair of sequences.
+For the lattice sampler, the joint law can be computed explicitly. As Proposition 2 establishes, this
+can be computed by considering intersections between intervals whose endpoints depend on the
+relative position of a uniform sample within its final arithmetic interval. We visualize this in Figure 5.
+Unfortunately, the coupled law qij does not have full support over pairs of sequences: intuitively,
+this is because the lattice has only a single degree of freedom, the shared shift. This violates the
+support condition needed for importance sampling: the target law must be absolutely continuous
+with respect to the proposal. When this holds, the importance ratio has expectation 1. Empirically,
+we observed that the ratio was substantially below 1, consistent with support mismatch.
+3 Theoretical Analysis: an upper bound on pass@k for samplers with a
+target marginal
+Before evaluating QuasiMoTTo empirically, we first ask how much room there is to improve beyond
+i.i.d sampling. Intuitively, any sampler that respects the model’s marginal distribution (QuasiMoTTo
+included) can only rearrange the model’s capability across k rollouts; without training the model
+further, we cannot induce new capability. We formalize this as an upper bound on pass@k in terms
+of pass@1, which gives us a ceiling against which to measure our gains empirically.
+Theorem 2 (Per-problem pass@k upper bound). Let p denote the probability that a single sample solves a
+fixed problem, i.e. its pass@1 probability. Let P (k) denote the probability that at least one of k samples solves
+the problem. Then
+P (k) ≤ min{1, kp}.
+Proof. Let Sj be the event that the j-th sample solves the problem. By supposition, Pr(Sj ) = p for
+each j. The event that the problem is solved by at least one of the k samples is given by Sk
+j=1 Sj and by the union bound,
+P (k) = Pr
+
+
+k[
+j=1
+Sj
+
+ ≤
+kX
+j=1
+Pr(Sj ) = kp.
+We also must have P (k) ≤ 1. Combining the two bounds gives the desired result.
+As Figure 6 shows, the gap between i.i.d. and the upper bound depends on the configuration: if the
+problem is too easy, then the model will sample a correct answer with probability 1 regardless of
+how it is sampled, and if the problem is too hard, both the i.i.d. and upper bound pass@k vanish.
+The gap is maximized at k = 1/p, i.e. when the problem is hard but feasible, where i.i.d. achieves a
+pass@k of roughly 1 − (1 − 1
+k )k ≈ 1 − 1
+e = 0.632.
+Tightness. The bound is tight when the events {Sj }k
+j=1 are disjoint, i.e., when no two samples in
+the batch ever solve the problem in the same way simultaneously. Crucially, no sampling procedure
+that achieves this target pass@1 rate can do better than this upper bound, which places a theoretical
+limit on how good an entirely sampling-based, training-free method can be.
+4 Experiments
+We benchmark QuasiMoTTo on four reasoning tasks chosen to understand the effect of the sampler:
+each is hard enough that coverage matters (i.i.d. does not trivially saturate), admits a verifiable
+reward, and uses a compact symbolic vocabulary, avoiding the semantic equivalence class issues
+that arise in certain natural language reasoning tasks.
+Samplers. We use QuasiMoTTo to draw k samples via the three approaches described in Section 2.2: lattice, stratified, and token-level Sobol. We benchmark against i.i.d. draws k independent
+samples from the model and an upper bound that reflects the per-problem ceiling from Theorem 2.
+This characterizes the best pass@k achievable by any sampler that preserves the LM’s marginals. We
+estimate the per-problem pass@k via the bootstrap procedure of Section 2.4.1.
+Tasks. In Countdown [7, 8, 26], the model is given a target number and a list of numbers and must
+combine them using arithmetic operations (+, −, ×, /) to reach the target. In Maze [29], the model
+receives a 2D maze in text form and must output a sequence of moves (Up/Down/Left/Right)
+from a start to an end position. In Sudoku, the model fills in a partially-completed 9 × 9 grid
+subject to the standard constraints. In 1D-ARC [33], the model is shown a few input/output pairs of
+one-dimensional grids and must infer and apply the underlying transformation to a held-out input.
+See the Appendix A.1 for representative examples and solutions.
+Models. For Countdown, Sudoku, and Maze, we use Qwen3.5-0.8B-Base. We observe that off-theshelf LLMs perform poorly on these tasks: they struggle to adhere to format requirements (even
+instruction-tuned models) and hold a reasonable prior (e.g., they place zero mass on the correct
+solution). This makes it challenging to apply RL directly to these models [8]. Thus, for these three
+tasks, we perform supervised fine-tuning on 50,000 correct question/answer pairs. For 1D-ARC, we
+use Qwen3.5-2B-Base directly. ARC inputs are inductive by nature — containing multiple in-context
+examples — so the base model already produces well-formatted outputs, and does not require any
+additional supervised fine-tuning.
+
+k
+20
+40
+60
+80
+pass@k
+Maze
+i.i.d.
+QuasiMoTTo
+Upper Bound
+4 8 16 32 64
+k
+25
+50
+75
+Sudoku
+4 8 16 32 64
+k
+20
+40
+60
+1D Arc
+4 8 16 32 64
+k
+40
+60
+80
+CountdownFigure 7: QuasiMoTTo pass@k analysis. QuasiMoTTo (lattice) consistently dominates i.i.d. sampling
+across all four reasoning benchmarks. Strikingly, QuasiMoTTo closely tracks the pass@k upper
+bound that no training-free sampler can exceed. Note, we plot error bars ±1 SD but they are small
+enough that they are not visible in the plot above. Importantly, the upper bound curve aggregates
+over multiple problems, which is why it is not piecewise linear in k.
+Evaluation. For each task we report pass@k (i.e. 1 if at least one of the k attempts is correct), and
+the pass@k upper bound, averaged across all problems. To isolate the effect of the sampler, all
+methods share the same model, prompt, and decoding temperature; only the joint distribution of the
+underlying uniforms differs. We use temperature 1.0 and top-p 0.95 throughout, with a maximum
+completion length of 32 tokens for Countdown and Maze, and 280 tokens for Sudoku and 1D-ARC.
+4.1 Pass@k results
+QuasiMoTTo substantially outperforms i.i.d. and comes close to saturating the upper bound. In
+Figure 7, we see that QuasiMoTTo (lattice-based) sampler produces a significantly higher pass@k
+than i.i.d. sampling at every value of k, across all four tasks. We only present results for the lattice
+based sampler here, but we provide the pass@k for all samplers in Figure 13 in the Appendix.
+Strikingly, the QuasiMoTTo pass@k curves track the upper bound closely; this means there is little
+room for any training-free sampler (that preserves the marginals) to further improve performance.
+This holds, to different degrees, across a diverse set of tasks with different solution geometries
+— arithmetic search (Countdown), spatial planning (Maze), constraint satisfaction (Sudoku), and
+pattern induction (1D-ARC). Note that, although the upper bound from Section 3 is (piecewise)
+linear in k, it is a per-problem upper bound and the pass@k curves in Figure 7 aggregate over problems
+with different accuracies.
+QuasiMoTTo sample efficiency. We can also ask how many fewer samples QuasiMoTTo needs
+to match a given i.i.d. pass rate; we present these results in Figure 8. For the lattice-based sampler, QuasiMoTTo reaches i.i.d.’s performance with a 25-47% reduction in samples. Therefore, at
+deployment, we can use QuasiMoTTo to reduce the rollout budget at matched quality or hold the
+budget fixed and spend the freed FLOPs elsewhere. The compute savings are essentially free since
+the per-rollout overhead of QuasiMoTTo is negligible (one extra uniform draw per batch plus the
+inverse-CDF bookkeeping). The other non-lattice QMC methods also improve sample-efficiency,
+although to a lesser extent.
+4.2 Policy-gradient based reinforcement learning
+Since QuasiMoTTo produces exact samples from the LM, we can use it as a drop-in replacement for
+policy-gradient based reinforcement learning. If QuasiMoTTo can produce more diverse outcomes target pass@k
+60%
+80%
+100%
+Percent of i.i.d. samples
+i.i.d.
+Maze
+44% fewer samples
+Lattice
+Stratified
+Sobol
+20 40 60 80
+target pass@k
+60%
+80%
+100% i.i.d.
+Sudoku
+47% fewer samples
+20 40 60
+target pass@k
+60%
+80%
+100% i.i.d.
+1D Arc
+39% fewer samples
+40 60 80
+target pass@k
+80%
+90%
+100% i.i.d.
+Countdown
+25% fewer samplesFigure 8: QuasiMoTTo boosts sample efficiency. QuasiMoTTo can use 25%-47% fewer samples than
+i.i.d. sampling while achieving the same accuracy. These performance gains hold across different
+QMC methods although lattice performs best.100 200 300 400 500 600
+Checkpoint step
+0.08
+0.10
+0.12
+0.14
+0.16
+pass@1
+Eval pass@1 vs. training step
+i.i.d.
+QuasiMoTTo (Lattice)
+QuasiMoTTo (Sobol)
+QuasiMoTTo (Stratified)
+0.07 0.08 0.09 0.10 0.11 0.12 0.13
+pass@1 threshold
+100
+200
+300
+400
+500
+Training step
+Steps to reach pass@1 threshold
+Maze100 200 300 400 500 600 700 800
+Checkpoint step
+0.045
+0.050
+0.055
+0.060
+0.065
+0.070
+0.075
+pass@1
+Eval pass@1 vs. training step
+0.040 0.045 0.050 0.055 0.060 0.065 0.070 0.075
+pass@1 threshold
+100
+200
+300
+400
+500
+600
+Training step
+Steps to reach pass@1 threshold
+Sudoku
+Figure 9: QuasiMoTTo compute efficiency for RL. We plot the pass@1 on evaluation set against the
+training step. QuasiMoTTo achieves the same pass@1 in fewer steps compared to i.i.d sampling.
+within a group, it can boost the effective sample size per gradient step and decrease the number of
+training steps required to achieve a target performance.
+Setup. We train Qwen3.5-0.8B-Base on Maze and Sudoku using GRPO [11] to measure whether
+QuasiMoTTo rollouts translate into faster policy improvement. As a baseline, we also train the
+model using an i.i.d. sampler. We use a group size of G = 8, 64 unique prompts per gradient step,
+sampling temperature τ = 1.0, and a max completion length of 256 tokens. We perform 2 gradient
+steps per rollout batch (i.e., 2 off-policy updates). We use sequence level off-policy importance
+
+Training step
+0.5
+0.6
+0.7
+0.8
+Frac. zero-std prompts
+Frac. zero-variance prompts
+0 100 200 300 400 500 600
+Training step
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+Reward
+Training Reward
+QuasiMoTTo (Lattice)
+QuasiMoTTo (Stratified)
+QuasiMoTTo (Sobol)
+i.i.d.
+QuasiMoTTo vs i.i.d. RL training dynamicsFigure 10: QuasiMoTTo RL training dynamics. (left) QuasiMoTTo produces consistently fewer
+zero-variance groups (i.e., groups in which G rollouts all succeed or all fail and contribute no
+learning signal) throughout training because it samples responses with higher coverage. (right) This
+larger effective sample size causes QuasiMoTTo’s training reward to rise faster.
+sampling [35]. Note that, because we use a group baseline with dependent samples, we introduce
+some amount of bias; see Section 2.4.2.
+Experiments were run on 4 H100s/A100s. We organize our analysis around two questions: (1) does
+using QuasiMoTTo during RL training translate into a compute-efficiency win (fewer steps to get
+the same reward), and (2) how do correlated samples change the training dynamics?
+GRPO background. We provide some basic background on GRPO. Concretely, for a prompt x,
+the policy πθ generates G completions y1, . . . , yG and receives rewards r1, . . . , rG. GRPO forms a
+group-relative advantage for each completion by comparing its reward to the rewards of the other
+completions from the same prompt; the i-th completion gets advantage Ai = ri − mean(r1, . . . , rG).
+If all G completions for a prompt receive the same reward, then the group has zero reward variance
+and contributes no policy-gradient signal. We call such a group a zero-variance group when all rollouts
+are correct, or incorrect. Zero variance groups are a significant practical challenge: they increase the
+policy gradient variance, by reducing the number of prompts the LM gets a learning signal from in a
+batch (i.e., the effective sample size [34]).
+Hard-problem pass@k filtering. In GRPO-style training, learning is primarily driven by rare
+but correct rollouts; questions that are too hard or easy result in more zero-variance groups, less
+learning signal, and increased noise [10, 34]. As established in Section 3, we also expect QuasiMoTTo
+samplers to exhibit the most improvement over i.i.d. in this hard-but-feasible regime. Thus, to
+better study the effects of QuasiMoTTo on RL training, we filter out Maze and Sudoku problems
+which are too easy or too hard. We do this as a preprocessing step by generating 32 completions per
+problem with the base model checkpoint, and filtering out problems with an average pass rate = 0
+or > 1
+G = 0.125.
+QuasiMoTTo is a compute efficiency win. In Figure 9, we compare the evaluation set pass@1 for
+QuasiMoTTo against i.i.d. sampling; for evaluation, we use QuasiMoTTo sampler for both methods
+to isolate the benefits of using the QMC sampler at training time. QuasiMoTTo provides a consistent
+compute-efficiency win; we can achieve the same target pass@1 in 50% fewer steps. In the Appendix,
+we report error bars (Figure 14).
+
+(b) Token-level Sobol
+Hello World! Hello world
+hello World! hello world
+Hellohello
+first token x1
+World! world
+second token x2
+U = (u1, u2) = (0.2, 0.7)
+hello Hello
+u1
+F −1
+1
+World! world
+u2
+F −1
+2 (· | hello)
+⇒ hello world
+(a) i.i.d. vs. stratified vs. lattice
+i.i.d.
+0 1
+stratified
+0 1
+lattice
+0 1
+freedom
+coverage
+high
+low
+low
+high
+I(Ui; Uj )
+0
+log k
+k − 1
+∞
+Figure 11: A visual overview of the QMC samplers. (a) Independent, stratified, and lattice sampling
+are 1-D samplers that trade freedom for coverage: from top to bottom, freedom falls and coverage
+rises, tracked by the pairwise mutual information I(Ui; Uj ). (b) Token-level Sobol folds the sequence
+dimension n into the QMC space. In this n = 2 toy, the axes are the first and second tokens (with
+a conditional second-token split), and the six points spread across rows and columns rather than
+clumping. Decoding sends coordinate j through the model’s j-th inverse CDF: U = (0.2, 0.7) yields
+hello world.
+QuasiMoTTo sampling improves training dynamics by reducing zero-gradient groups. With i.i.d.
+sampling, the rollouts in a group frequently coincide, in which case the group-relative advantage
+collapses to zero and the gradient update carries no signal. In Figure 10, we see that QuasiMoTTo
+actively mitigates this: QuasiMoTTo encourages rollouts to occupy different regions of the sequence
+space. We see this clearly reflected in a smaller percentage of zero-variance groups. The result is
+faster improvement due to a larger effective sample size. Interestingly, although dependent samples
+introduce some amount of bias through the group relative baseline (Section 2.4.2), this is more than
+compensated by the increase in the effective batch size.
+4.3 Theoretical and empirical tradeoffs between samplers
+In this section we provide a high-level picture for how QuasiMoTTo samplers (lattice, stratified, and
+Sobol) relate to each other and to i.i.d. sampling. The goal is to build intuition for why different
+samplers lead to the different pass@k and RL results shown above.
+Freedom vs. coverage. Of the three 1D samplers, independent sampling has the most freedom:
+samples do not influence one other at all, and coverage guarantees are weak. As we move to
+stratified and then lattice sampling, the “freedom" gets more restricted — points repel one another
+more strongly — and the coverage consequently increases (Figure 11). This explains why pass@k monotonically increases from i.i.d. to stratified to lattice in Section 4.1, and why the proportion of
+zero-variance groups drops in Section 4.2.
+One way to quantify this tradeoff is through the pairwise mutual information
+I(Ui; Uj ) = H(Ui) − H(Ui | Uj ),
+an information-theoretic quantity which measures how much information one gains about a random
+variable by conditioning on another variable. For independent samples this is trivially 0. For
+stratified sampling, conditioning on Uj reduces the possible space of Ui from [0, 1] to a region of
+length k−1
+k , so the mutual information is
+−
+Z 1
+0
+log 1 du +
+Z k−1
+k
+0
+k
+k − 1 log k
+k − 1 du = log k
+k − 1 .
+For lattice sampling, since conditioning on any point Uj makes any other point Ui deterministic, the
+distribution collapses to a point mass and the differential entropy H(Ui | Uj ) is −∞.
+We note that stratified empirically outperforms lattice when applied to RL (Section 4.2), which
+is seemingly at odds with this freedom vs. coverage intuition. We hypothesize that this is a
+consequence of the RLOO bias mentioned in Section 2.4.2: lattice has higher coverage but higher
+bias, which overall hurts training more than stratified.
+Sequence-level vs. token-level coverage. Unlike lattice/stratified sampling, Sobol sequences
+are defined over a high-dimensional space. The coverage applies locally at each token position
+rather than globally for the whole sequence. We would therefore expect Sobol to perform somewhat
+weaker than stratified or lattice, but still stronger than i.i.d., an intuition which holds in the pass@k
+and RL experiments above.
+5 Related Work
+Beam Search Beam search and its diverse variants [30] also boost diversity, but their outputs do
+not correspond to draws from a well-defined distribution, let alone the LM’s, which precludes their
+use within procedures like RL (they would introduce substantial bias). Stochastic beam search [15]
+reduces redundancy by drawing structured sets of distinct sequences. However, because sampling
+without replacement changes the sequence probabilities, unbiased estimation with respect to the LM
+requires importance weight corrections. This suffers from the conventional challenges of importance
+weighting such as high variance.
+Exploration in RL Recent approaches modify the RL or SFT training objective to induce broader
+coverage over rollouts [1, 12, 13, 24, 29]. Our approach is orthogonal: we intervene at the sampling
+stage rather than during training, leaving the objective untouched.
+Efficient sampling Most work on efficient LLM inference lowers the cost of each rollout. IO-aware
+exact attention removes the memory bottleneck of softmax attention [4], paged memory management
+raises serving throughput [16], sparse attention drops the quadratic scaling in context length [5], and
+learned KV cache compression methods reduce the size of the context [18, 21]. Orthogonally, one can
+reduce latency by restructuring a single chain of thought into subtasks executed in parallel [20, 26].
+All of these make a rollout cheaper or faster; QuasiMoTTo instead reduces the number of rollouts
+needed to reach a target performance.
+
+6 Conclusions & Limitations
+We introduced QuasiMoTTo, an approach that combines randomized QMC and inverse CDF
+sampling to generate a dependent batch of LM rollouts for scaling inference compute. Each rollout
+is an exact sample from the LM, but the batch as a whole covers the output space more evenly. This
+buys compute efficiency: 25–47% fewer samples to match i.i.d. pass@k on reasoning benchmarks,
+often saturating the union-bound ceiling that no marginal-preserving sampler can exceed; and 50%
+fewer GRPO steps to hit a target pass@1, driven by a drop in zero-variance groups.
+Our experiments use 1–2B parameter models on tasks with shorter outputs for challenging symbolic
+reasoning tasks. Extending QuasiMoTTo to long chain-of-thought reasoning requires defining a
+notion of coverage over semantic equivalence classes of solutions. It would also be interesting to
+see if QuasiMoTTo can boost coverage and diversity in open-ended tasks where this is particularly
+important, like scientific discovery [9, 14, 17, 22]. These are natural directions for future work.
+7 Acknowledgements
+We thank members of Cocolab and Dynamode Lab, particularly Ivy Zhang and Qizhong Zhang, for
+thoughtful feedback on this project. We thank Omar Shaikh and Matt Jorke for insightful discussions.
+We thank Jubayer Ibn Hamid and Suvir Mirchandi for helpful discussions. Some of the experiments
+for this project was performed on the Marlowe cluster at Stanford University. This work was
+supported in part by ONR Grant N00014-22-1-2110, NSF Grant 2205084, and the Stanford Institute
+for Human-Centered Artificial Intelligence (HAI). EBF is a Biohub, San Francisco, Investigator.
+
+References
+[1] Feng Chen, Allan Raventos, Nan Cheng, Surya Ganguli, and Shaul Druckmann. Rethinking
+fine-tuning when scaling test-time compute: Limiting confidence improves mathematical
+reasoning. In The Thirty-ninth Annual Conference on Neural Information Processing Systems, 2026.
+[2] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared
+Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri,
+Gretchen Krueger, Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke Chan,
+Scott Gray, Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad Bavarian,
+Clemens Winter, Philippe Tillet, Felipe Petroski Such, Dave Cummings, Matthias Plappert,
+Fotios Chantzis, Elizabeth Barnes, Ariel Herbert-Voss, William Hebgen Guss, Alex Nichol, Alex
+Paino, Nikolas Tezak, Jie Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain, William Saunders,
+Christopher Hesse, Andrew N. Carr, Jan Leike, Josh Achiam, Vedant Misra, Evan Morikawa,
+Alec Radford, Matthew Knight, Miles Brundage, Mira Murati, Katie Mayer, Peter Welinder, Bob
+McGrew, Dario Amodei, Sam McCandlish, Ilya Sutskever, and Wojciech Zaremba. Evaluating
+large language models trained on code, 2021. URL https://arxiv.org/abs/2107.03374.
+[3] Thomas M. Cover and Joy A. Thomas. Elements of Information Theory. Wiley Series in Telecommunications and Signal Processing. Wiley-Interscience, USA, 2 edition, 2006. ISBN 0471241954.
+[4] Tri Dao, Daniel Y Fu, Stefano Ermon, Atri Rudra, and Christopher Re. Flashattention: Fast and
+memory-efficient exact attention with IO-awareness. In Alice H. Oh, Alekh Agarwal, Danielle
+Belgrave, and Kyunghyun Cho, editors, Advances in Neural Information Processing Systems, 2022.
+[5] DeepSeek-AI. Deepseek-v3.2: Pushing the frontier of open large language models, 2025.
+[6] Alek Dimitriev and Mingyuan Zhou. CARMS: Categorical-antithetic-REINFORCE multisample gradient estimator. In Advances in Neural Information Processing Systems, volume 34.
+Curran Associates, Inc., 2021.
+[7] Kanishk Gandhi, Denise H J Lee, Gabriel Grand, Muxin Liu, Winson Cheng, Archit Sharma,
+and Noah Goodman. Stream of search (sos): Learning to search in language. In First Conference
+on Language Modeling, 2024.
+[8] Kanishk Gandhi, Ayush K Chakravarthy, Anikait Singh, Nathan Lile, and Noah Goodman.
+Cognitive behaviors that enable self-improving reasoners, or, four habits of highly effective
+STars. In Second Conference on Language Modeling, 2025.
+[9] Kanishk Gandhi, Michael Y. Li, Lyle Goodyear, Agam Bhatia, Louise Li, Aditi Bhaskar, Mohammed Zaman, and Noah D. Goodman. Boxinggym: Benchmarking progress in automated
+experimental design and model discovery, 2025.
+[10] Agastya Goel and Linden Li. Speeding up rl with highleverage samples. https://www.appliedcompute.com/research/
+speeding-up-rl-with-high-leverage-samples, 2026.
+[11] Daya Guo et al. Deepseek-r1 incentivizes reasoning in llms through reinforcement learning.
+Nature, page 633–638, 2025.
+[12] Jubayer Ibn Hamid, Ifdita Hasan Orney, Michael Y. Li, Omar Shaikh, Yoonho Lee, Dorsa Sadigh,
+Chelsea Finn, and Noah Goodman. Spiral: Learning to search and aggregate, 2026. URL
+https://arxiv.org/abs/2606.23595.
+
+[13] Jubayer Ibn Hamid, Ifdita Hasan Orney, Ellen Xu, Chelsea Finn, and Dorsa Sadigh. Polychromic
+objectives for reinforcement learning. In The Fourteenth International Conference on Learning
+Representations, 2026.
+[14] Joy He-Yueya, Anikait Singh, Ge Gao, Michael Y. Li, Sherry Yang, Chelsea Finn, Emma Brunskill,
+and Noah D. Goodman. Giants: Generative insight anticipation from scientific literature, 2026.
+[15] Wouter Kool, Herke Van Hoof, and Max Welling. Stochastic beams and where to find them:
+The Gumbel-top-k trick for sampling sequences without replacement. In Proceedings of the 36th
+International Conference on Machine Learning, 2019.
+[16] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+serving with pagedattention. In Proceedings of the 29th Symposium on Operating Systems Principles,
+2023.
+[17] Michael Y. Li, Emily B. Fox, and Noah D. Goodman. Automated statistical model discovery
+with language models, 2024.
+[18] Michael Y. Li, Jubayer Ibn Hamid, Emily B. Fox, and Noah D. Goodman. Neural garbage
+collection: Learning to forget while learning to reason, 2026.
+[19] David J. C. MacKay. Information theory, inference & learning algorithms, 2002.
+[20] Arvind Mahankali, Kaiyue Wen, and Tengyu Ma. Divide-and-conquer cot: Rl for reducing
+latency via parallel reasoning, 2026.
+[21] Yuzhen Mao, Michael Y. Li, and Emily B. Fox. Simplified sparse attention via gist tokens, 2026.
+[22] Alexander Novikov, Ngân V ˜u, Marvin Eisenberger, Emilien Dupont, Po-Sen Huang,
+Adam Zsolt Wagner, Sergey Shirobokov, Borislav Kozlovskii, Francisco J. R. Ruiz, Abbas
+Mehrabian, M. Pawan Kumar, Abigail See, Swarat Chaudhuri, George Holland, Alex Davies,
+Sebastian Nowozin, Pushmeet Kohli, and Matej Balog. Alphaevolve: A coding agent for
+scientific and algorithmic discovery, 2025. URL https://arxiv.org/abs/2506.13131.
+[23] OpenAI. Openai o1 system card, 2026.
+[24] Ifdita Hasan Orney, Jubayer Ibn Hamid, Shreya S Ramanujam, Shirley Wu, Hengyuan Hu,
+Noah Goodman, Dorsa Sadigh, and Chelsea Finn. Poly-epo: Training exploratory reasoning
+models, 2026.
+[25] Art B. Owen. Monte Carlo Theory, Methods and Examples. Art Owen, 2013.
+[26] Jiayi Pan, Xiuyu Li, Long Lian, Charlie Victor Snell, Yifei Zhou, Adam Yala, Trevor Darrell,
+Kurt Keutzer, and Alane Suhr. Learning adaptive parallel reasoning with language models. In
+Second Conference on Language Modeling, 2025.
+[27] Aditya Parashar, Aditya Vikram Singh, Avinash Amballa, Jinlin Lai, and Benjamin Rozonoyer.
+Quasi-random multi-sample inference for large language models, 2025.
+[28] I.M Sobol’. On the distribution of points in a cube and the approximate evaluation of integrals.
+USSR Computational Mathematics and Mathematical Physics, 7(4):86–112, 1967. ISSN 0041-5553.
+doi: https://doi.org/10.1016/0041-5553(67)90144-9. URL https://www.sciencedirect.
+com/science/article/pii/0041555367901449.
+
+[29] Fahim Tajwar, Guanning Zeng, Yueer Zhou, Yuda Song, Daman Arora, Yiding Jiang, Jeff
+Schneider, Ruslan Salakhutdinov, Haiwen Feng, and Andrea Zanette. Maximum likelihood
+reinforcement learning, 2026.
+[30] Ashwin K. Vijayakumar, Michael Cogswell, Ramprasaath R. Selvaraju, Qing Sun, Stefan Lee,
+David J. Crandall, and Dhruv Batra. Diverse beam search: Decoding diverse solutions from
+neural sequence models. CoRR, abs/1610.02424, 2016.
+[31] Luke Vilnis, Yury Zemlyanskiy, Patrick Murray, Alexandre Passos, and Sumit Sanghai. Arithmetic sampling: parallel diverse decoding for large language models. In Proceedings of the 40th
+International Conference on Machine Learning, ICML’23. JMLR.org, 2023.
+[32] Larry Wasserman. All of statistics : a concise course in statistical inference. New York, 2010.
+[33] Yudong Xu, Wenhao Li, Pashootan Vaezipoor, Scott Sanner, and Elias B. Khalil. Llms and
+the abstraction and reasoning corpus: Successes, failures, and the importance of object-based
+representations, 2024.
+[34] Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai,
+Tiantian Fan, Gaohong Liu, Lingjun Liu, Xin Liu, Haibin Lin, Zhiqi Lin, Bole Ma, Guangming
+Sheng, Yuxuan Tong, Chi Zhang, Mofan Zhang, Wang Zhang, Hang Zhu, Jinhua Zhu, Jiaze
+Chen, Jiangjie Chen, Chengyi Wang, Hongli Yu, Yuxuan Song, Xiangpeng Wei, Hao Zhou,
+Jingjing Liu, Wei-Ying Ma, Ya-Qin Zhang, Lin Yan, Mu Qiao, Yonghui Wu, and Mingxuan
+Wang. Dapo: An open-source llm reinforcement learning system at scale, 2025. URL https:
+//arxiv.org/abs/2503.14476.
+[35] Chujie Zheng, Shixuan Liu, Mingze Li, Xiong-Hui Chen, Bowen Yu, Chang Gao, Kai Dang,
+Yuqiong Liu, Rui Men, An Yang, Jingren Zhou, and Junyang Lin. Group sequence policy
+optimization, 2025.
+
+A Technical appendices and supplementary material
+A.1 Experiment Details
+Maze Countdown
+*********
+*E..*...*
+*.***.***
+*.......*
+***.*.***
+*...*...*
+*S*.*****
+*.*.....*
+*********
+URRUULLUU
+Target: 89
+Numbers: [57, 43, 11]
+43+57-11
+Sudoku 1D-ARC
+8 4 5 2 _ _ 1 3 7
+2 _ 9 _ 5 3 _ _ 6
+6 _ _ _ _ _ _ _ 5
+7 5 _ 9 8 6 _ 1 3
+1 _ _ _ 4 _ _ _ 2
+4 _ 6 _ _ _ _ _ 8
+_ 2 _ _ 3 _ _ 8 9
+_ 8 _ _ _ 1 6 2 _
+9 6 _ 8 7 _ 3 5 1
+8 4 5 2 6 9 1 3 7
+2 1 9 7 5 3 8 4 6
+6 7 3 4 1 8 2 9 5
+7 5 2 9 8 6 4 1 3
+1 9 8 3 4 7 5 6 2
+4 3 6 1 2 5 9 7 8
+5 2 1 6 3 4 7 8 9
+3 8 7 5 9 1 6 2 4
+9 6 4 8 7 2 3 5 1
+Input: [0,0,5,0,0,0,0,0,0,0,0,5,0,0]
+Output: [0,0,5,5,5,5,5,5,5,5,5,5,0,0]
+Input: [0,0,7,0,0,0,0,0,0,0,0,7,0,0]
+Output: [0,0,7,7,7,7,7,7,7,7,7,7,0,0]
+Input: [2,0,0,0,0,0,0,0,0,2,0,0,0,0]
+Output: [2,2,2,2,2,2,2,2,2,2,0,0,0,0]
+Input: [7,0,0,0,7,0,0,0,0,0,0,0,0,0]
+Output:
+[7,7,7,7,7,0,0,0,0,0,0,0,0,0]
+Figure 12: Representative examples from each of the four tasks.
+
+Table 1: Hyperparameters for Maze and Sudoku experiments.
+Hyperparameter Value
+Optimizer AdamW
+Learning rate 1 × 10−6
+(β1, β2) (0.9, 0.95)
+ϵAdam 1 × 10−8
+Weight decay 0.01
+Max gradient norm 1.0
+KL coefficient (β) 0.01
+PPO clip range (ϵ) 0.2
+Off-policy epochs 2
+A.2 Additional experimental results4 8 16 32 64
+k
+20
+40
+60
+80
+pass@k
+Maze
+i.i.d.
+Lattice
+Upper Bound
+Stratified
+Sobol
+4 8 16 32 64
+k
+25
+50
+75
+Sudoku
+4 8 16 32 64
+k
+20
+40
+60
+1D Arc
+4 8 16 32 64
+k
+40
+60
+80
+Countdown
+Figure 13: QuasiMoTTo pass@k analysis for all samplers.
+
+Checkpoint step
+0.06
+0.08
+0.10
+0.12
+0.14
+0.16
+pass@1
+Eval pass@1 vs. training step
+i.i.d.
+QuasiMoTTo (Lattice)
+QuasiMoTTo (Sobol)
+QuasiMoTTo (Stratified)
+0.07 0.08 0.09 0.10 0.11 0.12 0.13
+pass@1 threshold
+100
+200
+300
+400
+500
+Training step
+Steps to reach pass@1 threshold
+Maze100 200 300 400 500 600 700 800
+Checkpoint step
+0.04
+0.05
+0.06
+0.07
+0.08
+pass@1
+Eval pass@1 vs. training step
+0.040 0.045 0.050 0.055 0.060 0.065 0.070 0.075
+pass@1 threshold
+100
+200
+300
+400
+500
+600
+Training step
+Steps to reach pass@1 threshold
+SudokuFigure 14: QuasiMoTTo compute efficiency for RL. We plot the pass@1 on evaluation set against
+the training step. QuasiMoTTo achieves the same pass@1 in fewer steps compared to i.i.d sampling.
+Error bars are computed as follows: we estimate the accuracy pi for each of n questions and report
+std(p)
+√n .
+A.3 Theoretical analyses
+Theorem 1 (Correctness of dyadic bootstrap sampling). Let k = 2L, and let
+ui =
+
+∆ + i
+k
+
+mod 1, i = 0, . . . , k − 1,
+where ∆ ∼ Unif([0, 1]). For any x ≤ L, set m = k/2x. Then each stride-2x subsequence
+u(r)
+j := ur+2xj , j = 0, . . . , m − 1,
+with r ∈ {0, . . . , 2x − 1}, is distributed exactly as a fresh randomly shifted lattice of size m. Consequently,
+each such subsequence gives an unbiased pass@m estimate under the randomized-lattice construction.
+Proof. Let s = 2x, so m = k/s. For any offset r,
+ur+sj =
+
+∆ + r + sj
+k
+
+mod 1 =
+
+∆ + r
+k + j
+m
+
+mod 1.
+The last equality substitutes 1
+m for s
+k . Define
+∆(r) :=
+
+∆ + r
+k
+
+mod 1.
+
+For a fixed lattice subsequence, r and k, are constants, so r
+k is a deterministic shift. Since adding a
+deterministic constant modulo 1 preserves the uniform distribution ∆(r) is also uniform on [0, 1].
+Finally substituting ∆(r) and noting that adding a constant before reducing modulo 1 is the same as
+first reducing the shifted quantity modulo 1, we obtain
+ur+sj =
+
+∆(r) + j
+m
+
+mod 1,
+which is exactly an m-point lattice with a uniform random shift. Therefore any pass@m estimator
+computed on this subsequence has the same expectation as the estimator computed on a fresh
+m-point randomized lattice.
+Theorem 2 (Bootstrap estimator for stratified sampling). Following the notation above, let {ui}k−1
+i=0 be a
+set of stratified samples
+ui ∼ Unif[ i
+k , i+1
+k ], i = 0, . . . , k − 1.
+Then, to obtain a bootstrapped stratified sample for m = k/2x, we can partition ui’s into contiguous blocks of
+size k/m = 2x
+{u0, . . . , uk/m−1} ∪ {uk/m, . . . , u2k/m−1} ∪ · · · ∪ {u(m−1)k/m, . . . , uk−1}
+and sample once from each partition
+u′
+i ∼ {uik/m, . . . , u(i+1)k/m−1}
+so that {u′
+i}m−1
+i=0 is distributed according to the stratified rule for m samples, i.e., ui ∼ Unif[ i
+m , i+1
+m ].
+Theorem 3 (Bootstrap estimator for Sobol sampling). Let {ui}k−1
+i=0 be a length k Sobol sequence in
+dimension n
+ui ∈ [0, 1]n.
+Sobol sequences of length 2L are constructed such that any prefix of length 2x < 2L is itself a valid Sobol
+sequence. So, to obtain an unbiased pass@m estimate, we can simply take contiguous blocks of k/m:
+u(r)
+j := urm+j , j = 0, . . . , m − 1,
+which gives bootstrapped samples for r ∈ {0, . . . , 2x − 1}.
+The proofs for the above two bootstrap estimators follow analogously to the proof above for the
+dyadic estimator for lattice sampling.
+Proposition 1 (Characterization of RLOO as a product-of-differences estimator). Let y1, . . . , yn be
+sampled trajectories from a policy πθ(y). Let r(yi) ∈ R denote the reward of trajectory yi, and define the score
+sθ(yi) := ∇θ log πθ(yi).
+The leave-one-out policy-gradient estimator
+gRLOO(θ) = 1
+n
+nX
+i=1
+
+r(yi) − 1
+n − 1
+X
+j̸ =i
+r(yj )
+
+ sθ(yi)
+can be written equivalently as
+gRLOO(θ) = 1
+n(n − 1)
+X
+i̸=j
+1
+2 (r(yi) − r(yj )) (sθ(yi) − sθ(yj )) .
+
+Proof. Starting from the leave-one-out estimator,
+gRLOO(θ) = 1
+n
+nX
+i=1
+
+r(yi) − 1
+n − 1
+X
+j̸ =i
+r(yj )
+
+ sθ(yi).
+Expanding,
+gRLOO(θ) = 1
+n
+nX
+i=1
+r(yi)sθ(yi) − 1
+n(n − 1)
+nX
+i=1
+X
+j̸ =i
+r(yj )sθ(yi).
+We first make the left and right term symmetric by introducing dummy indices that allow us to
+re-write the first term as a pairwise sum:
+1
+n
+nX
+i=1
+r(yi)sθ(yi) = 1
+n
+nX
+i=1
+1
+n − 1
+X
+j̸ =i
+r(yi)sθ(yi) = 1
+n(n − 1)
+X
+i̸=j
+r(yi)sθ(yi).
+Therefore,
+gRLOO(θ) = 1
+n(n − 1)
+X
+i̸=j
+(r(yi)sθ(yi) − r(yj )sθ(yi)) .
+Since we can simply relabel i with j, we also have
+X
+i̸=j
+(r(yi)sθ(yi) − r(yj )sθ(yi)) = X
+i̸=j
+(r(yj )sθ(yj ) − r(yi)sθ(yj )) .
+Therefore, we can write the RLOO estimator as
+gRLOO(θ) = 1
+n(n − 1)
+X
+i̸=j
+1
+2 [r(yi)sθ(yi) − r(yj )sθ(yi) + r(yj )sθ(yj ) − r(yi)sθ(yj )] .
+Finally, factoring we have
+gRLOO(θ) = 1
+n(n − 1)
+X
+i̸=j
+1
+2 (r(yi) − r(yj )) (sθ(yi) − sθ(yj )) .
+as desired.
+A.3.1 Computing pair probability under the lattice QMC construction.
+Preliminaries. Let V∗ denote the set of finite token sequences. Arithmetic sampling defines a
+deterministic decoder
+Dec0 : [0, 1) → V∗,
+where Dec0(u) is the sequence obtained by running arithmetic decoding with latent u ∈ [0, 1). For
+each sequence y ∈ V∗, define its arithmetic interval
+I0(y) := {u ∈ [0, 1) : Dec0(u) = y}.
+Equivalently,
+I0(y) = [L(y), L(y) + W (y)) ⊂ [0, 1),
+where
+W (y) = πθ(y) =
+TY
+t=1
+πθ(yt | y<t).
+
+For the pair-probability calculation, it will be convenient to identify [0, 1) with the unit circle
+S1 = R/Z.
+Under this identification, addition is modulo one, and I0(y) is viewed as a subset I(y) ⊂ S1. We will
+write the resulting decoder simply as
+Dec : S1 → V∗.
+Lemma 1 (Pair probability as a circular overlap). Let b ∼ Unif(S1), and suppose the lattice QMC latents
+are
+uk = b + αk (mod 1),
+where αk ∈ S1 is deterministic. For k ∈ {i, j}, let yk ∈ V∗ be a sequence of interest, and define
+Ik := I(yk).
+Define the shifted interval
+Jk := Ik − αk := {b ∈ S1 : b + αk ∈ Ik}.
+Then
+qij (yi, yj ) := Pr(Dec(b + αi) = yi, Dec(b + αj ) = yj ) = λS1 (Ji ∩ Jj ),
+where λS1 denotes normalized Lebesgue measure on S1.
+Proof. By definition of Ii,
+Dec(b + αi) = yi ⇐⇒ b + αi ∈ Ii.
+By definition, Ji = Ii − αi, so the above is equivalent to
+b ∈ Ji.
+Similarly,
+Dec(b + αj ) = yj ⇐⇒ b ∈ Jj .
+Therefore the joint event is exactly
+{b : Dec(b + αi) = yi, Dec(b + αj ) = yj } = Ji ∩ Jj .
+Since b is uniform on S1, the probability of this event is
+qij (yi, yj ) = λS1 (Ji ∩ Jj ).
+Thus, pair probabilities in a QMC group are determined by overlaps among the shifted intervals.
+Numerically stable calculation Lemma 1 shows that the pair probability is the length of the
+overlap Ji ∩ Jj , where
+Jk = Ik − αk.
+Naively, this involves materializing the arithmetic intervals which is numerically unstable since it
+requires computing the raw sequence probabilities. We now describe a numerically stable alternative.
+A useful way to think about how to compute this overlap is through how much we can perturb this
+shared random shift while maintaining the same two decoded sequences.
+Let b0 be the realized shared shift that generated the observed sequences. Thus
+uk = b0 + αk (mod 1), uk ∈ Ik.
+
+Now consider a candidate shifted value b0 + δ. For sample k, this perturbation keeps the decoded
+sequence equal to yk precisely when
+b0 + δ ∈ Jk.
+Equivalently, adding back the offset αk,
+uk + δ ∈ Ik.
+Thus Jk − b0 is exactly the set of perturbations δ of the shared shift that keep sample k decoding to
+yk.
+By translation invariance of Lebesgue measure on S1, we may center the calculation at b0:
+λS1 (Ji ∩ Jj ) = λS1
+ (Ji − b0) ∩ (Jj − b0).
+Moreover, without loss of generality, we can assume the shared anchor is at 0, and the problem can
+be reduced to computing which perturbations δ keep both decoded sequences the same.
+The residual coordinate gives these allowable perturbations. For the kth sample, define
+zk = uk − Lk
+Wk
+∈ [0, 1).
+Equivalently,
+uk = Lk + Wkzk.
+Thus zk is the fractional position of the sampled latent inside its final arithmetic interval
+Ik = [Lk, Lk + Wk).
+It determines the left and right slacks of uk within Ik:
+ℓk := uk − Lk = Wkzk, rk := Lk + Wk − uk = Wk(1 − zk).
+In words, ℓk is how far we can move uk to the left before leaving Ik, and rk is how far we can move
+uk to the right before leaving Ik.
+Therefore the perturbation that keep sample k fixed are thes ones where uk + δ remains inside Ik.
+This is exactly when
+δ ∈ [−ℓk, rk) (mod 1).
+Since this condition must be satisfied so that both samples i and j remain fixed, we obtain
+qij (yi, yj ) = λS1 ([−ℓi, ri) ∩ [−ℓj , rj )) ,
+Again, the intersection is understood on the circle.
+Proposition 2 (Stable formula for the circular overlap).
+Proof. By the calculation above,
+qij (yi, yj ) = λS1 (Ki ∩ Kj ),
+where
+Ki = [−ℓi, ri) (mod 1), Kj = [−ℓj , rj ) (mod 1).
+Cut the circle at 0. Then,
+Kk = [0, rk) ∪ [1 − ℓk, 1).
+The overlap has four possible contributions.
+The first two conditions are best understood by considering how two sub-intervals within the unit
+interval can intersect. First, the two right pieces overlap by
+λ [0, ri) ∩ [0, rj ) = min(ri, rj ).
+
+Second, the two left pieces overlap by
+λ [1 − ℓi, 1) ∩ [1 − ℓj , 1) = min(ℓi, ℓj ).
+The last conditions are more subtle and occur when there is wrap-around.
+First, the right piece of Ki can overlap the left piece of Kj :
+[0, ri) ∩ [1 − ℓj , 1).
+This intersection is nonempty exactly when ri + ℓj > 1. In that case its length is ri + ℓj − 1. Thus its
+contribution is
+(ri + ℓj − 1)+.
+Similarly, the left piece of Ki can overlap the right piece of Kj , contributing
+(ℓi + rj − 1)+.
+Adding the four contributions gives
+qij (yi, yj ) = min(ℓi, ℓj ) + min(ri, rj ) + (ri + ℓj − 1)+ + (ℓi + rj − 1)+.
+
+Ki = [−ℓi, ri) Kj = [−ℓj , rj ) overlap
+circle T unwrapped [0, 1], cut at 0
+min(ri, rj )
+right slacks 0
+0 1
+min(ℓi, ℓj )
+left slacks
+0
+0 1
+(ri + ℓj − 1)+
+wrap-around 0
+0 1
+(ℓi + rj − 1)+
+wrap-around (mirror) 0
+0 1
+Figure 15: The pairwise probability qij = λT(Ki ∩ Kj ) decomposes into four terms by Proposition 2.
+In each row, we visualize the intersections, showing both the intersection on the circle (left) and the
+corresponding intersections on the unit interval (arbitrarily) cut at 0 (right). Rows 1–2 show the two
+pieces of the overlap adjacent to the cut at 0, with lengths min(ri, rj ) and min(ℓi, ℓj ). Rows 3–4 show
+the additional “cross” intersections that appear when one interval reaches far enough to meet the
+opposite side of the other interval, with lengths (ri + ℓj − 1)+ and (ℓi + rj − 1)+.

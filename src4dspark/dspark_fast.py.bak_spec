@@ -1,0 +1,684 @@
+"""Fast DSpark engine: one batched target forward per round, GDN rollback by delta-rule rewind,
+and optional multi-branch rollout verification.
+
+vs dspark_e2e.DSparkDecode ("deepcopy snapshot + replay forward", 2 forwards/round):
+
+  1. Snapshot = the 18 GDN (conv, recurrent) state clones only (~0.2 ms); the 6 attention layers'
+     KV is append-only per-token and simply cropped back on rejection.
+  2. On rejection the GDN recurrent state after the accepted prefix is RECONSTRUCTED
+     mathematically: the gated delta rule is prefix-associative, so
+         S(after prefix) = RecurStep(S_before_round, factors of accepted tokens)
+     with one batched fla `fused_recurrent_gated_delta_rule` call over all 18 layers. The per-token
+     factors (post-conv q/k/v, beta, g) are recomputed OUTSIDE the layer from the verify forward's
+     own hidden_states. Verified against a true forward: max abs diff 2.6e-3 (bf16 noise).
+  3. The correction token becomes the next round's anchor (it is a lawful target sample), so the
+     verify chunk is always [anchor, d1..dn] — no separate decode/replay forward, ever.
+  4. Sampling is inverse CDF everywhere — there is no Gumbel-max path in this engine.
+     Anchor tokens: _sample draws one fresh uniform and inverts the CDF. Draft slots:
+     _propose_multi walks ONE uniform per branch through the nested inverse-CDF chain
+     (u <- (u - F(x))/q(x) at every slot); mode='stratified' (default) draws the per-branch
+     uniforms from disjoint strata (QMC coupling), mode='iid' draws them independently —
+     both are inverse CDF, only the draw differs. Acceptance AND correction share one
+     uniform per slot via the inverse CDF of the fused outcome {accept: min(1,p/q)} ∪ {corr c: (1-a)(p-c)+/Z}.
+  5. `branches=B`: sample B independent draft chains (shared drafter base logits; batched markov),
+     verify them as a batch of B sequences in the SAME target forward, commit the deepest-accepted
+     chain (+ its correction). On this launch-bound engine the batched verify costs the same wall
+     time as B=1 (measured 30.1/29.8/30.3/30.3 ms at B=1/2/4/8) — extra rollouts are ~free.
+     GDN layers cannot share state across tree branches, so branches are isolated on the batch
+     dimension (each gets its own copy of the prefix state), NOT via tree attention.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dflash_big import CTX_HS  # noqa: E402
+from dspark_paper import ND  # noqa: E402
+from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule  # noqa: E402
+
+
+def _pos2(pos0, length, B, dev):
+    return torch.arange(pos0, pos0 + length, device=dev).view(1, -1).expand(B, -1).contiguous()
+
+
+class GdnRewinder:
+    """Snapshot / restore / mathematically rewind the 18 GDN layers of a Qwen3.5 cache."""
+
+    def __init__(self, model):
+        cfg = model.config.text_config if hasattr(model.config, 'text_config') else model.config
+        types = cfg.layer_types
+        self.dev = model.device
+        self.gdn_layer_idx = [i for i, t in enumerate(types) if t == 'linear_attention']
+        assert len(self.gdn_layer_idx) == 18
+        core = model.model
+        lm = getattr(core, 'language_model', None) or getattr(core, 'model', core)
+        layers = lm.layers
+        mods = [layers[i].linear_attn for i in self.gdn_layer_idx]
+        lns = [layers[i].input_layernorm for i in self.gdn_layer_idx]
+        self.ln_w = torch.stack([(1.0 + ln.weight.float()) for ln in lns]).to(self.dev)      # (18,1024)
+        self.eps = lns[0].eps
+        self.w_qkv = torch.stack([m.in_proj_qkv.weight for m in mods]).to(self.dev)          # (18,6144,1024)
+        self.w_b = torch.stack([m.in_proj_b.weight for m in mods]).to(self.dev)              # (18,16,1024)
+        self.w_a = torch.stack([m.in_proj_a.weight for m in mods]).to(self.dev)              # (18,16,1024)
+        self.conv_w = torch.stack([m.conv1d.weight.squeeze(1) for m in mods]).to(self.dev)   # (18,6144,4)
+        self.a_log = torch.stack([m.A_log for m in mods]).to(self.dev)                       # (18,16)
+        self.dt_bias = torch.stack([m.dt_bias for m in mods]).to(self.dev)                   # (18,16)
+        assert cfg.hidden_act == 'silu'
+        self.kern = cfg.linear_conv_kernel_dim
+        self.kdim, self.vdim = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        self.nk, self.nv = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+        assert self.nk == self.nv
+        self.conv_dim = self.nk * self.kdim * 2 + self.nv * self.vdim
+
+    def snap(self, cache):
+        out = []
+        for i in self.gdn_layer_idx:
+            l = cache.layers[i]
+            out.append((l.conv_states[0].clone(), l.recurrent_states[0].clone()))
+        return out
+
+    def restore(self, cache, snap, n_crop):
+        """GDN states <- snapshot; attention KV <- remove the last n_crop rows."""
+        for b, i in enumerate(self.gdn_layer_idx):
+            l = cache.layers[i]
+            l.conv_states[0].copy_(snap[b][0])
+            l.recurrent_states[0].copy_(snap[b][1])
+        if n_crop:
+            for i, l in enumerate(cache.layers):
+                if i not in self.gdn_layer_idx:
+                    l.crop(-n_crop)
+
+    def rewind(self, cache, snap, hs, j, bidx=0):
+        """Rebuild GDN states as of chunk position j-1 of verify row `bidx`.
+
+        hs: hidden_states tuple from the (possibly batched) verify forward; entry i = input of
+        decoder layer i, (B, L, H). Writes conv+recurrent states of all 18 GDN layers in place.
+        """
+        h = torch.stack([hs[i][bidx, :j] for i in self.gdn_layer_idx], 0)                   # (18,j,1024)
+        h = (h.float() * torch.rsqrt(h.float().pow(2).mean(-1, keepdim=True) + self.eps))
+        h = (h * self.ln_w[:, None, :]).to(self.w_qkv.dtype)
+        mixed = torch.bmm(h, self.w_qkv.transpose(1, 2))                                    # (18,j,6144)
+        beta = torch.sigmoid(torch.bmm(h, self.w_b.transpose(1, 2)))                        # (18,j,16)
+        a = torch.bmm(h, self.w_a.transpose(1, 2))
+        g = -self.a_log.float().exp()[:, None, :] * F.softplus(a.float() + self.dt_bias.float()[:, None, :])
+        full_conv = torch.cat([torch.stack([s[0][0] for s in snap], 0),
+                               mixed.transpose(1, 2)], -1)                                  # (18,6144,4+j)
+        acc = torch.zeros_like(full_conv[:, :, :j])
+        for m_ in range(self.kern):
+            acc = acc + self.conv_w[:, :, m_].unsqueeze(-1) * full_conv[:, :, m_ + 1:m_ + 1 + j]
+        y = F.silu(acc)
+        qkv = y.transpose(1, 2)
+        q, k, v = torch.split(qkv, [self.nk * self.kdim, self.nk * self.kdim, self.nv * self.vdim], -1)
+        q = q.view(18, j, self.nk, self.kdim)
+        k = k.view(18, j, self.nk, self.kdim)
+        v = v.view(18, j, self.nv, self.vdim)
+        _, final = torch_recurrent_gated_delta_rule(
+            q, k, v, g=g, beta=beta,
+            initial_state=torch.stack([s[1][0] for s in snap], 0),
+            output_final_state=True, use_qk_l2norm_in_kernel=True)
+        for b, i in enumerate(self.gdn_layer_idx):
+            l = cache.layers[i]
+            l.recurrent_states[0].copy_(final[b])
+            l.conv_states[0].copy_(full_conv[b][:, -self.kern:])
+
+
+def _is_attn_layer(l):
+    return not hasattr(l, 'recurrent_states')
+
+
+class DSparkDecodeFast:
+    def __init__(self, model, drafter, tokenizer, temperature=1.0, seed=0):
+        self.m, self.d, self.tok = model, drafter, tokenizer
+        self.T = temperature
+        self.gen = torch.Generator(device=model.device).manual_seed(seed)
+        self.dev = model.device
+        # torch.compile note (test/try_compile.py): ~11% cap, breaks the full generate path.
+        self.rw = GdnRewinder(model)
+
+    def _feats(self, hs):
+        return torch.stack([hs[j] for j in CTX_HS], 2).flatten(2)                           # (B,L,5120)
+
+    @torch.inference_mode()
+    def prefill(self, ids):
+        o = self.m(input_ids=ids, use_cache=True, output_hidden_states=True, logits_to_keep=1)
+        return o.past_key_values, o.logits[0, -1].float(), self._feats(o.hidden_states)
+
+    @torch.inference_mode()
+    def _forward(self, cache, tokens, pos0):
+        """tokens (B, L). Returns v_lg (B,L,V), feats (B,L,5120), hs tuple, cache."""
+        B, L = tokens.shape
+        o = self.m(input_ids=tokens, past_key_values=cache,
+                   position_ids=_pos2(pos0, L, B, self.dev),
+                   use_cache=True, output_hidden_states=True, logits_to_keep=L)
+        return o.logits.float(), self._feats(o.hidden_states), o.hidden_states, o.past_key_values
+
+    def _sample(self, row):
+        """One uniform -> inverse CDF over the tempered distribution (exact categorical sample).
+
+        The drawn uniform is freshly randomised per anchor; within a draft block the uniform
+        is propagated as the inverse-CDF residual (see _propose_single / nested-CDF lemma).
+        """
+        p = torch.softmax(row.float() / self.T, dim=-1)
+        cdf = p.cumsum(-1)
+        u = torch.rand((), device=self.dev, generator=self.gen)
+        return torch.searchsorted(cdf, u, right=True).clamp(max=p.shape[-1] - 1)
+
+    @torch.inference_mode()
+    def _propose_multi(self, feats1, anchor, anchor_pos, n, B, mode='stratified'):
+        """B draft chains; every chain is one uniform walked through the nested inverse-CDF
+        chain. Only the DRAW of the per-branch uniform differs by mode:
+
+        mode='stratified' (QMC, default): the block distribution laid out on [0,1)
+        lexicographically (interval width = block probability); branch b gets
+        u_b = (perm[b]+v_b)/B with perm a fresh random permutation of the B strata and
+        v_b ~ U(0,1) — the B paths cover the block distribution PROPORTIONALLY
+        (large-probability blocks always hit, small ones hit in proportion). The random
+        permutation is REQUIRED: it makes each u_b marginally uniform, so every path is
+        an exact sample of P(block) and the acceptance test stays lossless. A fixed
+        stratum order would pin branch b to one CDF region and bias its proposal.
+
+        mode='iid' (baseline): u_b ~ U(0,1) drawn independently per branch, then walked
+        through the SAME inverse-CDF chain. Independent chains — no coverage coupling.
+
+        In both modes the 7-token path is a deterministic function of one uniform via the
+        nested chain CDF, and the final residual is returned for cross-round propagation.
+
+        Returns Lg (B,n,V) tempered logits (proposal dist for the acceptance test), ids (B,n),
+        lps (B,) = log P(draft block) under the drafter, and the residual uniform (B,).
+        """
+        V = self.d.lm_head.weight.shape[0]
+        hctx = self.d.encode_ctx(feats1[:anchor_pos].unsqueeze(0))
+        o = torch.tensor([[anchor_pos - 1]], device=self.dev)
+        z = self.d.backbone(hctx, self.d.embed(anchor.view(1, 1)), o)[0, 0]                 # (n,H)
+        base = self.d.lm_head(z.to(self.d.lm_head.weight.dtype)).float()                    # (n,V)
+        v = torch.rand(B, device=self.dev, generator=self.gen)
+        if mode == 'iid':
+            u = v                                                                           # independent uniforms
+        else:
+            # RANDOMLY PERMUTED strata: without the permutation, branch b would be pinned
+            # to stratum b forever, so its uniform would NOT be marginally uniform and its
+            # drafted tokens would not follow q (breaking losslessness for that rollout).
+            # With a random permutation each round, every branch's uniform is marginally
+            # U(0,1) while the group still covers every stratum exactly once.
+            perm = torch.randperm(B, device=self.dev, generator=self.gen).float()
+            u = (perm + v) / B                                                              # stratified [0,1)
+        prev = anchor.view(1).expand(B)
+        Lg = torch.empty(B, n, V, device=self.dev)
+        ids = torch.empty(B, n, dtype=torch.long, device=self.dev)
+        lps = torch.zeros(B, device=self.dev)
+        for j in range(n):
+            lgj = (base[j].unsqueeze(0) + self.d.markov(prev)) / self.T                     # (B,V)
+            Lg[:, j] = lgj
+            q = torch.softmax(lgj, -1)
+            cdf = q.cumsum(-1)                                                              # (B,V)
+            xj = torch.searchsorted(cdf, u.unsqueeze(1), right=True).squeeze(1)
+            xj = xj.clamp(max=V - 1)
+            qx = q.gather(1, xj.unsqueeze(1)).squeeze(1).clamp_min(1e-12)
+            lo = (cdf.gather(1, xj.unsqueeze(1)).squeeze(1) - qx)                           # mass before x
+            lps += torch.log(qx)
+            u = ((u - lo) / qx).clamp(0.0, 1.0 - 1e-7)                                      # nested residual
+            ids[:, j] = xj
+            prev = xj
+        return Lg, ids, lps, u
+
+    @torch.inference_mode()
+    def _propose_single(self, feats1, anchor, anchor_pos, n, u, mode='stratified'):
+        """Single-chain draft using a GIVEN uniform u (for chain-coupled randomness).
+        Returns (Lg (n,V), ids (n,), lps, u_residual). The residual is still U(0,1) by the
+        nested-inverse-CDF lemma, so reusing it next round is lossless."""
+        V = self.d.lm_head.weight.shape[0]
+        hctx = self.d.encode_ctx(feats1[:anchor_pos].unsqueeze(0))
+        o = torch.tensor([[anchor_pos - 1]], device=self.dev)
+        z = self.d.backbone(hctx, self.d.embed(anchor.view(1, 1)), o)[0, 0]
+        base = self.d.lm_head(z.to(self.d.lm_head.weight.dtype)).float()
+        prev = anchor.clone() if isinstance(anchor, torch.Tensor) else torch.tensor(anchor, device=self.dev)
+        Lg = torch.empty(n, V, device=self.dev)
+        ids = torch.empty(n, dtype=torch.long, device=self.dev)
+        lps = torch.zeros((), device=self.dev)
+        uu = float(u)
+        for j in range(n):
+            lgj = (base[j] + self.d.markov(prev.view(1))[0]) / self.T
+            Lg[j] = lgj
+            q = torch.softmax(lgj, -1)
+            cdf = q.cumsum(-1)
+            xj = int(torch.searchsorted(cdf, torch.tensor(uu, device=self.dev), right=True).clamp(max=V - 1))
+            qx = float(q[xj].clamp_min(1e-12))
+            lo = float(cdf[xj]) - qx
+            lps = lps + torch.log(q[xj])
+            uu = min(max((uu - lo) / qx, 0.0), 1.0 - 1e-7)
+            ids[j] = xj
+            prev = torch.tensor(xj, device=self.dev)
+        return Lg, ids, lps, torch.tensor(uu, device=self.dev)
+
+    def _accept_multi(self, q_lg, ids, p_lg):
+        """Per-slot one-uniform fused accept+correct (see dspark_fast docstring), vectorized over
+        B branches and n slots; commits the DEEPEST-accepted chain. Returns (k, corr, bidx)."""
+        Bn, n = ids.shape
+        p = torch.softmax(p_lg / self.T, -1)
+        q = torch.softmax(q_lg, -1)
+        pt = p.gather(2, ids.unsqueeze(-1)).squeeze(-1)                                     # (B,n)
+        qt = q.gather(2, ids.unsqueeze(-1)).squeeze(-1)
+        a = (pt / qt.clamp_min(1e-12)).clamp(max=1.0)
+        u = torch.rand(Bn, n, device=self.dev, generator=self.gen)
+        rej = u >= a
+        first = torch.cat([rej, torch.ones(Bn, 1, dtype=torch.bool, device=self.dev)], 1).int().argmax(1)
+        bidx = int(first.argmax())                                                          # deepest chain
+        k = int(first[bidx])
+        if k == n:
+            return n, None, bidx
+        uk, ak = u[bidx, k], a[bidx, k]
+        res = (p[bidx, k] - q[bidx, k]).clamp_min(0)
+        Z = res.sum()
+        if float(Z) <= 0.0:                                                                 # unreachable; guard
+            return k, p[bidx, k].argmax(), bidx
+        scaled = (uk - ak).clamp_min(0) / (1.0 - ak) * Z                                    # in [0, Z)
+        corr = torch.searchsorted(res.cumsum(-1), scaled.unsqueeze(0))[0]
+        corr = corr.clamp(max=q_lg.shape[-1] - 1)
+        return k, corr, bidx
+
+    @staticmethod
+    def _expand_cache(cache, B):
+        if B == 1:
+            return
+        for l in cache.layers:
+            if _is_attn_layer(l):
+                l.keys = l.keys.repeat(B, 1, 1, 1)
+                l.values = l.values.repeat(B, 1, 1, 1)
+            else:
+                l.conv_states[0] = l.conv_states[0].repeat(B, 1, 1)
+                l.recurrent_states[0] = l.recurrent_states[0].repeat(B, 1, 1, 1)
+
+    @staticmethod
+    def _select_branch(cache, k):
+        """Reduce a batch-B cache back to batch 1, keeping branch k."""
+        for l in cache.layers:
+            if _is_attn_layer(l):
+                l.keys = l.keys[k:k + 1]
+                l.values = l.values[k:k + 1]
+            else:
+                l.conv_states[0] = l.conv_states[0][k:k + 1]
+                l.recurrent_states[0] = l.recurrent_states[0][k:k + 1]
+
+    @staticmethod
+    def _branch_cache(cache, b):
+        """Extract branch b of a batch-B cache into a FRESH batch-1 cache.
+
+        Unlike deepcopy(cache)+_select_branch (which copies the whole batch-B state per
+        branch — O(B^2) memory, OOM at B=64 on long sequences), this allocates only the
+        batch-1 slice per layer. Tensors are cloned, not viewed, because later rounds
+        mutate conv/recurrent states in place (rw.restore).
+        """
+        import copy as _copy
+        c = _copy.copy(cache)                      # shallow cache shell
+        layers = []
+        for l in cache.layers:
+            nl = _copy.copy(l)                     # shallow layer shell
+            if _is_attn_layer(l):
+                nl.keys = l.keys[b:b + 1].clone()
+                nl.values = l.values[b:b + 1].clone()
+            else:
+                nl.conv_states = list(l.conv_states)
+                nl.conv_states[0] = l.conv_states[0][b:b + 1].clone()
+                nl.recurrent_states = list(l.recurrent_states)
+                nl.recurrent_states[0] = l.recurrent_states[0][b:b + 1].clone()
+            layers.append(nl)
+        c.layers = layers
+        return c
+
+    @torch.inference_mode()
+    @torch.inference_mode()
+    def generate_branches(self, prompt_ids, max_new_tokens=128, n=ND, branches=4,
+                          mode='stratified', return_all=True):
+        """Multi-path decode: B independent chains, each driven by its own coupled uniform.
+
+        Round 1: sample B chains from _propose_multi (inverse CDF; stratified QMC or iid).
+                 Verify all B in ONE batched target forward.
+                 Each chain gets (accepted prefix, correction anchor, residual u_b).
+                 ALL B chains are kept — none are discarded.
+        Round 2+: each chain advances independently with _propose_single(u=residual).
+                  The residual is U(0,1) by the nested-CDF lemma, so reusing it is lossless.
+                  No re-branching; B separate single-chain decode loops run to completion.
+
+        Returns:
+            if return_all=True : list of B (token_ids, stats) tuples, one per chain
+            if return_all=False: single (token_ids, stats) of the longest chain
+        """
+        import copy as _copy
+
+        B = max(1, int(branches))
+        ids_t = torch.tensor([prompt_ids], device=self.dev)
+        cache0, last0, feats0 = self.prefill(ids_t)
+        pos0 = ids_t.shape[1]
+        anchor0 = self._sample(last0)
+
+        # ---- Round 1: branch ----
+        Lg, dr, lps, u_res = self._propose_multi(feats0[0], anchor0, pos0, n, B, mode=mode)
+
+        snap = self.rw.snap(cache0)
+        cache0_orig = _copy.deepcopy(cache0)   # batch=1, pre-verify — for partial-accept beams
+        self._expand_cache(cache0, B)
+        chunk = torch.cat([anchor0.view(1, 1).expand(B, 1), dr], 1)          # (B, n+1)
+        v_lg, v_feats, hs, cache_exp = self._forward(cache0, chunk, pos0)
+
+        # per-branch acceptance (vectorised, same as _accept_multi but keep all branches)
+        p_b = torch.softmax(v_lg[:, :n] / self.T, -1)
+        q_b = torch.softmax(Lg, -1)
+        pt = p_b.gather(2, dr.unsqueeze(-1)).squeeze(-1)
+        qt = q_b.gather(2, dr.unsqueeze(-1)).squeeze(-1)
+        a_b = (pt / qt.clamp_min(1e-12)).clamp(max=1.0)
+        u_acc = torch.rand(B, n, device=self.dev, generator=self.gen)
+        rej = u_acc >= a_b
+        first = torch.cat([rej, torch.ones(B, 1, dtype=torch.bool, device=self.dev)],
+                           1).int().argmax(1)   # (B,) first rejection per branch
+
+        # build B independent beam states after round 1
+        beams = []
+        for bidx in range(B):
+            k = int(first[bidx])
+            if k == n:
+                c = self._branch_cache(cache_exp, bidx)      # batch-1 slice only (no O(B^2) copy)
+                new_feats  = torch.cat([feats0, v_feats[bidx:bidx+1]], 1)
+                new_pos    = pos0 + n + 1
+                committed  = chunk[bidx]
+                new_anchor = self._sample(v_lg[bidx, n])
+                new_u      = u_res[bidx]
+            else:
+                c = _copy.deepcopy(cache0_orig)   # batch=1, pre-verify state
+                self.rw.restore(c, snap, n_crop=(n + 1) - (k + 1))
+                self.rw.rewind(c, snap, hs, k + 1, bidx=bidx)
+                uk, ak = u_acc[bidx, k], a_b[bidx, k]
+                res = (p_b[bidx, k] - q_b[bidx, k]).clamp_min(0)
+                Z = res.sum()
+                if float(Z) <= 0.0:
+                    corr = p_b[bidx, k].argmax()
+                else:
+                    scaled = (uk - ak).clamp_min(0) / (1.0 - ak) * Z
+                    corr = torch.searchsorted(res.cumsum(-1), scaled.unsqueeze(0))[0]
+                    corr = corr.clamp(max=v_lg.shape[-1] - 1)
+                new_feats  = torch.cat([feats0, v_feats[bidx:bidx+1, :k+1]], 1)
+                new_pos    = pos0 + k + 1
+                committed  = chunk[bidx, :k+1]
+                new_anchor = corr
+                new_u      = u_res[bidx]
+
+            beams.append({
+                'cache': c, 'feats': new_feats, 'anchor': new_anchor,
+                'pos': new_pos, 'out': [committed], 'u': new_u,
+                'st': {'rounds': 1, 'draft_ms': 0.0, 'verify_ms': 0.0, 'rewind_ms': 0.0,
+                       'forwards': 1, 'accepted': [k], 'tokens': int(committed.numel()),
+                       'all_accepted': int(k == n), 'draft_lp': float(lps[bidx])}
+            })
+
+        # release the batch-B verify cache before the single-chain loops
+        del cache_exp
+        torch.cuda.empty_cache()
+
+        # ---- Round 2+: each beam independently runs single-chain DSpark ----
+        for bm in beams:
+            cache = bm['cache']
+            feats = bm['feats']
+            anchor = bm['anchor']
+            pos = bm['pos']
+            u_b = bm['u']
+            out = bm['out']
+            st = bm['st']
+            t_rew = 0.0
+
+            while sum(t.numel() for t in out) < max_new_tokens:
+                if bool((anchor == self.tok.eos_token_id).any()):
+                    break
+
+                t0 = time.perf_counter()
+                Lg1, dr1, lp1, u_b = self._propose_single(feats[0], anchor, pos, n, u_b, mode=mode)
+                torch.cuda.synchronize()
+                st['draft_ms'] += (time.perf_counter() - t0) * 1e3
+
+                snap1 = self.rw.snap(cache)
+                self._expand_cache(cache, 1)   # no-op; batch already 1
+                t0 = time.perf_counter()
+                chunk1 = torch.cat([anchor.view(1), dr1]).view(1, -1)
+                v_lg1, v_feats1, hs1, cache = self._forward(cache, chunk1, pos)
+                torch.cuda.synchronize()
+                st['verify_ms'] += (time.perf_counter() - t0) * 1e3
+                st['forwards'] += 1
+                st['rounds']   += 1
+
+                # single-chain accept (reuse _accept_multi with B=1)
+                k1, corr1, _ = self._accept_multi(
+                    Lg1.unsqueeze(0), dr1.unsqueeze(0), v_lg1[:, :n])
+                st['accepted'].append(k1)
+
+                if corr1 is None:
+                    st['all_accepted'] += 1
+                    feats = torch.cat([feats, v_feats1[0:1]], 1)
+                    pos += n + 1
+                    committed1 = chunk1[0]
+                    anchor = self._sample(v_lg1[0, n])
+                else:
+                    committed1 = chunk1[0, :k1+1]
+                    t0 = time.perf_counter()
+                    self.rw.restore(cache, snap1, n_crop=(n+1)-(k1+1))
+                    self.rw.rewind(cache, snap1, hs1, k1+1, bidx=0)
+                    torch.cuda.synchronize()
+                    t_rew += time.perf_counter() - t0
+                    feats = torch.cat([feats, v_feats1[0:1, :k1+1]], 1)
+                    pos += k1 + 1
+                    anchor = corr1
+
+                out.append(committed1)
+                st['tokens'] = sum(t.numel() for t in out)
+                if bool((committed1 == self.tok.eos_token_id).any()):
+                    break
+
+            st['rewind_ms'] = t_rew * 1e3
+            bm['final'] = torch.cat(out)[:max_new_tokens].tolist()
+            st['tokens'] = len(bm['final'])
+
+        results = [(bm['final'], bm['st']) for bm in beams]
+        if return_all:
+            return results
+        best = max(results, key=lambda x: x[1]['tokens'])
+        return best[0], best[1]
+
+    def generate_tree(self, prompt_ids, max_new_tokens=128, n=ND, branches=4, mode='stratified',
+                       max_beams=8, prune='median'):
+        """Tree-parallel decoding with beam pruning.
+
+        Each active beam drafts B chains → batch-verifies → forks into B child beams.
+        Pruning strategies (prune=):
+          'median' : drop k < median(k)  — prunes ~half, stable beam count
+          'mean'   : drop k < mean(k)
+          'nonzero': drop k == 0 only    — gentler, keeps all beams that accepted anything
+        Survivors capped at max_beams; at most max_beams target forwards per step.
+
+        Cache management: on rejection, child reuses the parent's snap + GDN rewind
+        (no full deepcopy); on full-accept, child is a slice of the already-computed
+        expanded cache (also no extra deepcopy). One deepcopy per PARENT beam per step
+        (for the snap), not per child.
+
+        GDN states per beam are independent (batch-dim isolation, no tree attention).
+        """
+        import copy as _copy
+        import statistics as _stat
+
+        B = max(1, int(branches))
+        ids_t = torch.tensor([prompt_ids], device=self.dev)
+        cache0, last0, feats0 = self.prefill(ids_t)
+        pos0 = ids_t.shape[1]
+        beams = [{'cache': cache0, 'feats': feats0, 'anchor': self._sample(last0),
+                  'pos': pos0, 'out': []}]
+        st = {'rounds': 0, 'draft_ms': 0.0, 'verify_ms': 0.0, 'rewind_ms': 0.0,
+              'forwards': 0, 'accepted': [], 'tokens': 0, 'all_accepted': 0,
+              'pruned': 0, 'beams_per_round': []}
+        t_rew = 0.0
+
+        def total_toks(bl):
+            return sum(sum(t.numel() for t in b['out']) for b in bl)
+
+        while beams and total_toks(beams) < max_new_tokens:
+            children = []
+
+            for bm in beams:
+                anchor, pos, feats, cache = bm['anchor'], bm['pos'], bm['feats'], bm['cache']
+
+                t0 = time.perf_counter()
+                Lg, dr, lps, _ = self._propose_multi(feats[0], anchor, pos, n, B, mode=mode)
+                torch.cuda.synchronize()
+                st['draft_ms'] += (time.perf_counter() - t0) * 1e3
+
+                # ONE deepcopy per parent (for the GDN snap shared across all children)
+                snap = self.rw.snap(cache)
+                cache_exp = _copy.deepcopy(cache)
+                self._expand_cache(cache_exp, B)
+                t0 = time.perf_counter()
+                chunk = torch.cat([anchor.view(1, 1).expand(B, 1), dr], 1)
+                v_lg, v_feats, hs, cache_exp = self._forward(cache_exp, chunk, pos)
+                torch.cuda.synchronize()
+                st['verify_ms'] += (time.perf_counter() - t0) * 1e3
+                st['forwards'] += 1
+                st['rounds']   += 1
+
+                p_lg = v_lg[:, :n]
+                p = torch.softmax(p_lg / self.T, -1)
+                q = torch.softmax(Lg, -1)
+                pt = p.gather(2, dr.unsqueeze(-1)).squeeze(-1)
+                qt = q.gather(2, dr.unsqueeze(-1)).squeeze(-1)
+                a_acc = (pt / qt.clamp_min(1e-12)).clamp(max=1.0)
+                u = torch.rand(B, n, device=self.dev, generator=self.gen)
+                rej = u >= a_acc
+                first = torch.cat([rej, torch.ones(B, 1, dtype=torch.bool, device=self.dev)],
+                                   1).int().argmax(1)
+
+                for bidx in range(B):
+                    k = int(first[bidx])
+                    if k == n:
+                        # full accept: extract this branch's batch-1 slice (no O(B^2) copy)
+                        c_child = self._branch_cache(cache_exp, bidx)
+                        new_feats  = torch.cat([feats, v_feats[bidx:bidx + 1]], 1)
+                        new_pos    = pos + n + 1
+                        committed  = chunk[bidx]
+                        new_anchor = self._sample(v_lg[bidx, n])
+                        st['all_accepted'] += 1
+                    else:
+                        # partial: restore from snap + GDN rewind — no extra deepcopy of snap
+                        c_child = _copy.deepcopy(cache)   # fresh copy of pre-verify state
+                        uk, ak = u[bidx, k], a_acc[bidx, k]
+                        res = (p[bidx, k] - q[bidx, k]).clamp_min(0)
+                        Z = res.sum()
+                        if float(Z) <= 0.0:
+                            corr = p[bidx, k].argmax()
+                        else:
+                            scaled = (uk - ak).clamp_min(0) / (1.0 - ak) * Z
+                            corr = torch.searchsorted(res.cumsum(-1), scaled.unsqueeze(0))[0]
+                            corr = corr.clamp(max=v_lg.shape[-1] - 1)
+                        t0 = time.perf_counter()
+                        self.rw.restore(c_child, snap, n_crop=(n + 1) - (k + 1))
+                        self.rw.rewind(c_child, snap, hs, k + 1, bidx=bidx)
+                        torch.cuda.synchronize()
+                        t_rew += time.perf_counter() - t0
+                        new_feats  = torch.cat([feats, v_feats[bidx:bidx + 1, :k + 1]], 1)
+                        new_pos    = pos + k + 1
+                        committed  = chunk[bidx, :k + 1]
+                        new_anchor = corr
+
+                    st['accepted'].append(k)
+                    eos_hit = (bool((committed == self.tok.eos_token_id).any()) or
+                               bool((new_anchor == self.tok.eos_token_id).any()))
+                    children.append({'cache': c_child, 'feats': new_feats,
+                                      'anchor': new_anchor, 'pos': new_pos,
+                                      'out': bm['out'] + [committed], 'k': k, 'eos': eos_hit})
+
+            st['beams_per_round'].append(len(children))
+
+            # -- prune --
+            if len(children) > 1:
+                ks = [c['k'] for c in children]
+                if prune == 'median':
+                    thr = _stat.median(ks)
+                elif prune == 'mean':
+                    thr = sum(ks) / len(ks)
+                else:  # nonzero: only drop k==0
+                    thr = 0.5
+                kept = [c for c in children if c['k'] >= thr]
+                if not kept:
+                    kept = [max(children, key=lambda c: c['k'])]
+                st['pruned'] += len(children) - len(kept)
+                if len(kept) > max_beams:
+                    kept.sort(key=lambda c: -c['k'])
+                    kept = kept[:max_beams]
+                children = kept
+
+            live = [c for c in children if not c['eos']]
+            beams = live if live else []
+            if not beams:
+                break
+
+        st['rewind_ms'] = t_rew * 1e3
+        pool = beams if beams else children
+        best = max(pool, key=lambda b: sum(t.numel() for t in b['out']))
+        all_toks = torch.cat(best['out'])[:max_new_tokens].tolist()
+        st['tokens'] = len(all_toks)
+        return all_toks, st
+
+
+    @torch.inference_mode()
+    def generate(self, prompt_ids, max_new_tokens=128, n=ND, branches=1, mode='stratified'):
+        B = max(1, int(branches))
+        ids = torch.tensor([prompt_ids], device=self.dev)
+        cache, last, feats = self.prefill(ids)
+        pos = ids.shape[1]
+        st = {'rounds': 0, 'draft_ms': 0.0, 'verify_ms': 0.0, 'rewind_ms': 0.0, 'forwards': 0,
+              'accepted': [], 'tokens': 0, 'all_accepted': 0, 'draft_lp': 0.0}
+        out = []
+        anchor = self._sample(last)
+        t_rew = 0.0
+        while sum(t.numel() for t in out) < max_new_tokens:
+            t0 = time.perf_counter()
+            Lg, dr, lps, _ = self._propose_multi(feats[0], anchor, pos, n, B, mode=mode)
+            torch.cuda.synchronize()
+            st['draft_ms'] += (time.perf_counter() - t0) * 1e3
+
+            snap = self.rw.snap(cache)
+            self._expand_cache(cache, B)
+            t0 = time.perf_counter()
+            chunk = torch.cat([anchor.view(1, 1).expand(B, 1), dr], 1)                      # (B,n+1)
+            v_lg, v_feats, hs, cache = self._forward(cache, chunk, pos)
+            k, corr, bidx = self._accept_multi(Lg, dr, v_lg[:, :n])
+            torch.cuda.synchronize()
+            st['verify_ms'] += (time.perf_counter() - t0) * 1e3
+            st['forwards'] += 1
+            st['rounds'] += 1
+            st['accepted'].append(k)
+            st['draft_lp'] = float(lps[bidx])
+
+            self._select_branch(cache, bidx)
+            if corr is None:
+                st['all_accepted'] += 1
+                feats = torch.cat([feats, v_feats[bidx:bidx + 1]], 1)
+                pos += n + 1
+                committed = chunk[bidx]
+                anchor = self._sample(v_lg[bidx, n])
+            else:
+                committed = chunk[bidx, :k + 1]
+                t0 = time.perf_counter()
+                self.rw.restore(cache, snap, n_crop=(n + 1) - (k + 1))
+                self.rw.rewind(cache, snap, hs, k + 1, bidx=bidx)
+                torch.cuda.synchronize()
+                t_rew += time.perf_counter() - t0
+                feats = torch.cat([feats, v_feats[bidx:bidx + 1, :k + 1]], 1)
+                pos += k + 1
+                anchor = corr
+            out.append(committed)
+            st['tokens'] = sum(t.numel() for t in out)
+            if bool((committed == self.tok.eos_token_id).any()):
+                break
+            if bool((anchor == self.tok.eos_token_id).any()):
+                out.append(anchor.view(1))          # pending correction is eos: emit and stop
+                break
+        st['rewind_ms'] = t_rew * 1e3
+        return torch.cat(out)[:max_new_tokens].tolist(), st

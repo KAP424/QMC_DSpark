@@ -1,0 +1,56 @@
+Wed Nov 18 07:46:14 PM CST 2026 drafter pipeline started
+Wed Nov 18 07:46:14 PM CST 2026 drafter pipeline started
+Wed Nov 18 07:46:14 PM CST 2026 [maze] gen on GPU0 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-maze-sft/hf_model
+Wed Nov 18 07:46:14 PM CST 2026 [maze] gen on GPU0 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-maze-sft/hf_model
+Wed Nov 18 07:46:14 PM CST 2026 [sudoku] gen on GPU1 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-sudoku-sft/hf_model
+Wed Nov 18 07:46:14 PM CST 2026 [sudoku] gen on GPU1 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-sudoku-sft/hf_model
+Wed Nov 18 07:49:29 PM CST 2026 [maze] gen done  (79 shards)
+Wed Nov 18 07:49:29 PM CST 2026 [maze] gen done  (79 shards)
+Thu Nov 19 12:42:32 AM CST 2026 [sudoku] gen done  (79 shards)
+Thu Nov 19 12:42:32 AM CST 2026 [sudoku] gen done  (79 shards)
+Thu Nov 19 12:42:32 AM CST 2026 wave1 gen done
+Thu Nov 19 12:42:32 AM CST 2026 wave1 gen done
+Thu Nov 19 12:42:32 AM CST 2026 [maze] drafter train on GPU0 -> /home/dev/KAP/parameter/draft/dspark_maze_sft
+Thu Nov 19 12:42:32 AM CST 2026 [maze] drafter train on GPU0 -> /home/dev/KAP/parameter/draft/dspark_maze_sft
+Thu Nov 19 12:42:32 AM CST 2026 [sudoku] drafter train on GPU1 -> /home/dev/KAP/parameter/draft/dspark_sudoku_sft
+Thu Nov 19 12:42:32 AM CST 2026 [sudoku] drafter train on GPU1 -> /home/dev/KAP/parameter/draft/dspark_sudoku_sft
+Thu Nov 19 12:43:18 AM CST 2026 [sudoku] drafter done  tau=
+Thu Nov 19 12:43:18 AM CST 2026 [sudoku] drafter done  tau=
+Thu Nov 19 12:51:09 AM CST 2026 [maze] drafter done  tau=2.343
+Thu Nov 19 12:51:09 AM CST 2026 [maze] drafter done  tau=2.343
+Thu Nov 19 12:51:09 AM CST 2026 wave1 drafter train done
+Thu Nov 19 12:51:09 AM CST 2026 wave1 drafter train done
+Thu Nov 19 12:51:09 AM CST 2026 [1d_arc] gen on GPU1 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-arc-sft/hf_model
+Thu Nov 19 12:51:09 AM CST 2026 [1d_arc] gen on GPU1 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-arc-sft/hf_model
+Thu Nov 19 12:51:09 AM CST 2026 [countdown] gen on GPU0 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-countdown-sft/hf_model
+Thu Nov 19 12:51:09 AM CST 2026 [countdown] gen on GPU0 target=/home/dev/KAP/parameter/target/Qwen3.5-0.8B-Base-countdown-sft/hf_model
+Thu Nov 19 12:51:26 AM CST 2026 [countdown] gen done  (79 shards)
+Thu Nov 19 12:51:26 AM CST 2026 [countdown] gen done  (79 shards)
+Thu Nov 19 12:51:27 AM CST 2026 [1d_arc] gen done  (0 shards)
+Thu Nov 19 12:51:27 AM CST 2026 [1d_arc] gen done  (0 shards)
+Thu Nov 19 12:51:27 AM CST 2026 wave2 gen done
+Thu Nov 19 12:51:27 AM CST 2026 wave2 gen done
+Thu Nov 19 12:51:27 AM CST 2026 [countdown] drafter train on GPU0 -> /home/dev/KAP/parameter/draft/dspark_countdown_sft
+Thu Nov 19 12:51:27 AM CST 2026 [countdown] drafter train on GPU0 -> /home/dev/KAP/parameter/draft/dspark_countdown_sft
+Thu Nov 19 12:51:27 AM CST 2026 [1d_arc] drafter train on GPU1 -> /home/dev/KAP/parameter/draft/dspark_arc_sft
+Thu Nov 19 12:51:27 AM CST 2026 [1d_arc] drafter train on GPU1 -> /home/dev/KAP/parameter/draft/dspark_arc_sft
+Thu Nov 19 12:51:55 AM CST 2026 [1d_arc] drafter done  tau=
+Thu Nov 19 12:51:55 AM CST 2026 [1d_arc] drafter done  tau=
+Thu Nov 19 01:25:50 AM CST 2026 [countdown] drafter done  tau=3.415
+Thu Nov 19 01:25:50 AM CST 2026 [countdown] drafter done  tau=3.415
+Thu Nov 19 01:25:50 AM CST 2026 wave2 drafter train done
+Thu Nov 19 01:25:50 AM CST 2026 wave2 drafter train done
+
+
+=== RESULTS ===
+=== RESULTS ===
+  dspark_maze_sft: tau=2.343
+  dspark_maze_sft: tau=2.343
+  dspark_sudoku_sft: tau=?
+  dspark_sudoku_sft: tau=?
+  dspark_countdown_sft: tau=3.415
+  dspark_countdown_sft: tau=3.415
+  dspark_arc_sft: tau=?
+  dspark_arc_sft: tau=?
+Thu Nov 19 01:25:56 AM CST 2026 DONE
+Thu Nov 19 01:25:56 AM CST 2026 DONE
