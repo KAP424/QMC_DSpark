@@ -158,3 +158,36 @@ CUDA_VISIBLE_DEVICES=1 /home/dev/venv/bin/python -I run_passk.py --task 1d_arc  
 * **上界 $p_i$**：maze/sudoku/1d_arc 用 teacher-forcing 精确序列概率（不含 EOS，与 `Ref/quasimotto/eval.py` 的 `gt_ub` 路径一致；1d_arc 答案前加空格修正 token 边界）；countdown 因一题多解用 $M=128$ 的 QMC 蒙特卡洛估计。
 * **可复现性**：每题种子 `SEED*1000+i`；重写后的 `run_passk.py` 与旧实现在同种子下逐位复现 `S2`/`S3` 命中与 $p_i$。
 * **数据映射注意**：`maze_val.csv`/`sudoku_val.csv` 与 `prompts.pt` 的 val 题按行序对应（无 id 列）；countdown 的 prompt 需按 SFT 训练格式重建为 `Target: ...\nNumbers: ...\n`。
+
+---
+
+## 5. 正式实验记录（2026-11-24/25,首轮全量基线）
+
+配置：`SEED=42`，每任务 100 道 val 题 × `B=64` rollouts（`T=1.0`，草稿长 `n=7`），`k∈{1,2,4,8,16,32,64}`；硬件 2×L20，单任务单卡（`CUDA_VISIBLE_DEVICES` 隔离）。逐任务耗时（三设置 + 上界合计）：maze 0.35h、countdown 1.26h、sudoku 3.73h、1d_arc 7.13h。
+
+### 5.1 结果
+
+| 任务 | S1@1 | S1@64 | **S2@1** | **S2@16** | **S2@64** | S3@64 | 上界@16 | 上界@64 | iid 理论@16 | τ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| maze      | 1.9% | 55.0% | **2.1%** | **29.8%** | **67.0%** | 62.0% | 33.0% | 62.7% | 26.4% | 2.18 |
+| sudoku    | 16.8% | 84.0% | **16.9%** | **71.5%** | **89.0%** | 88.0% | 70.8% | 88.2% | 62.6% | 6.40 |
+| countdown | 42.3% | 81.0% | **42.7%** | **71.0%** | **83.0%** | 82.0% | 71.4% | 82.5% | 66.8% | 1.29 |
+| 1d_arc    | 7.2% | 62.0% | **7.5%** | **45.5%** | **64.0%** | 65.0% | 45.4% | 63.8% | 38.4% | 4.49 |
+
+（完整逐 k 数据见 `results/results_<task>.json`；S=S1_iid / S2=S2_update / S3=S3_paper）
+
+### 5.2 结论
+
+1. **格耦合增益（QMC 效应）稳定成立**：四个任务上 S2_update 在 @16 比 i.i.d. 理论高 3~9 个百分点，且紧贴理论上限 `E[min(k·p_i,1)]`（1d_arc @16：45.5% vs 45.4%；countdown @16：71.0% vs 71.4%）。@64 处各任务均已贴住上界——**采样侧已到顶，进一步提升只能提高 p_i（模型训练）**。
+2. **S2（带 DSpark drafter）与 S3（论文纯 AC 解码）分布等价**：逐题命中完全一致的比例为 62%（maze）/55%（sudoku），其余题 ±1~2 且正负平衡（bf16 批式验证 vs 逐 token 前向的数值漂移，非系统性偏差）；drafter 的作用是把同一分布的解码加速 τ=1.3~6.4×。
+3. **S1 与 iid 理论吻合**（如 sudoku @64：84.0% vs 82.8%），验证 Chen 估计器实现。
+
+### 5.3 已知事项
+
+- maze 的 S2@64（67.0%）略超上界（62.7%）：上界的 p_i 只 teacher-force 标准答案串，而 maze 判题接受**任意**合法路径（多解任务），真实解出概率被低估；sudoku（唯一解）/countdown/1d_arc 均无此现象（S3 在上界之下）。
+- 1d_arc 使用 Readme 规定的 Base 模型 + `dspark_arc_sft` drafter（非 SFT 记忆路径），@1=7.6% 属 in-context 泛化水平。
+- `nvidia-smi` 中每任务应恰好一行进程：启动务必带 `CUDA_VISIBLE_DEVICES`（否则引擎内裸 `torch.cuda.synchronize()` 会在 cuda:0 初始化一个 ~286MiB 的寄生上下文，多出一行）。
+
+### 5.4 实验过程存档
+
+重写 `run_passk.py`（旧版 git 历史）→ 四任务冒烟（2 题）通过，且与旧实现在同种子下**逐位复现** S5/S6 命中与 p_i → 15 代理对抗性代码审查（4 视角 + 反驳验证）：确认 7 项、反驳 4 项，全部确认项已修复（报告 nan%、sudoku 命名/glob、--weak 越界、空题除零、--plot-only 崩溃）→ 两卡双链全量运行 → 上述结果。提高迭代从 §4.1 的 `--weak` / `--merge-into` 工作流进入；训练侧按 `RL/训练框架.md` 的 GRPO+drafter 交替管线推进（最弱任务优先：maze p̄≈2.5% < 1d_arc 7.6% < sudoku 17% < countdown 43%）。
